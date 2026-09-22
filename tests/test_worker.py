@@ -102,6 +102,12 @@ def test_classification_requires_all_robustness_gates():
     assert classify(metrics, {"min_trades": 60}, {}) == "hassas"
 
 
+def test_classification_applies_ftmo_loss_limits_when_metrics_exist():
+    metrics = {"trades": 100, "profit_factor": 1.5, "win_rate_pct": 45,
+               "max_drawdown_pct": 4, "max_daily_loss_pct": 5.1, "net_profit": 1000}
+    assert classify(metrics, {"max_daily_loss_pct": 5, "max_total_loss_pct": 10}) == "elenmiş"
+
+
 def test_persistent_verification_mismatch_becomes_invalid(tmp_path):
     store = Store(tmp_path / "studio.db")
     project = store.create_project("Invalid", 'strategy("Invalid")')

@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL DEFAULT 'pending',
     worker_id INTEGER,
     attempts INTEGER NOT NULL DEFAULT 0,
+    started_at REAL,
+    finished_at REAL,
     updated_at REAL NOT NULL,
     UNIQUE(project_id, task_key)
 );
@@ -86,6 +88,11 @@ class Store:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(projects)")}
             if "pine_hash" not in columns:
                 connection.execute("ALTER TABLE projects ADD COLUMN pine_hash TEXT")
+            task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+            if "started_at" not in task_columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN started_at REAL")
+            if "finished_at" not in task_columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN finished_at REAL")
             for row in connection.execute("SELECT id,pine_source FROM projects WHERE pine_hash IS NULL"):
                 digest = hashlib.sha256(row["pine_source"].encode("utf-8")).hexdigest()
                 connection.execute("UPDATE projects SET pine_hash=? WHERE id=?", (digest, row["id"]))
@@ -96,6 +103,28 @@ class Store:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def _refresh_project_status(connection: sqlite3.Connection, project_id: int) -> None:
+        rows = connection.execute(
+            "SELECT status,COUNT(*) count FROM tasks WHERE project_id=? GROUP BY status",
+            (project_id,),
+        ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        if counts.get("running", 0):
+            status = "running"
+        elif counts.get("pending", 0):
+            status = "queued"
+        elif counts and sum(counts.values()) == counts.get("cancelled", 0):
+            status = "cancelled"
+        elif counts:
+            status = "complete"
+        else:
+            status = "draft"
+        connection.execute(
+            "UPDATE projects SET status=?,updated_at=? WHERE id=?",
+            (status, time.time(), project_id),
+        )
 
     def create_project(self, name: str, pine_source: str, priority: int = 0) -> int:
         now = time.time()
@@ -113,6 +142,7 @@ class Store:
                 "INSERT OR IGNORE INTO tasks(project_id,task_key,payload,updated_at) VALUES(?,?,?,?)",
                 (project_id, task_key, json.dumps(payload, ensure_ascii=False), time.time()),
             )
+            self._refresh_project_status(connection, project_id)
             return cursor.rowcount == 1
 
     def enqueue_many(self, project_id: int, tasks: Any) -> int:
@@ -126,6 +156,7 @@ class Store:
                     (project_id, task_key, json.dumps(payload, ensure_ascii=False), now),
                 )
                 inserted += cursor.rowcount
+            self._refresh_project_status(connection, project_id)
             connection.commit()
         return inserted
 
@@ -169,10 +200,16 @@ class Store:
 
     def recover_interrupted(self) -> int:
         with self.connect() as connection:
+            project_ids = [int(row[0]) for row in connection.execute(
+                "SELECT DISTINCT project_id FROM tasks WHERE status='running'"
+            ).fetchall()]
             cursor = connection.execute(
-                "UPDATE tasks SET status='pending',worker_id=NULL,updated_at=? WHERE status='running'",
+                "UPDATE tasks SET status='pending',worker_id=NULL,started_at=NULL,updated_at=? "
+                "WHERE status='running'",
                 (time.time(),),
             )
+            for project_id in project_ids:
+                self._refresh_project_status(connection, project_id)
             return cursor.rowcount
 
     def claim_next(
@@ -205,13 +242,15 @@ class Store:
                 connection.commit()
                 return None
             updated = connection.execute(
-                "UPDATE tasks SET status='running',worker_id=?,attempts=attempts+1,updated_at=? "
+                "UPDATE tasks SET status='running',worker_id=?,attempts=attempts+1,"
+                "started_at=?,finished_at=NULL,updated_at=? "
                 "WHERE id=? AND status='pending'",
-                (worker_id, time.time(), row["id"]),
+                (worker_id, time.time(), time.time(), row["id"]),
             )
             if updated.rowcount != 1:
                 connection.rollback()
                 return None
+            self._refresh_project_status(connection, int(row["project_id"]))
             connection.commit()
             return ClaimedTask(
                 id=int(row["id"]),
@@ -250,13 +289,15 @@ class Store:
                 (task_id, row["project_id"], json.dumps(metrics, ensure_ascii=False), classification, now),
             )
             connection.execute(
-                "UPDATE tasks SET status='done',updated_at=? WHERE id=?", (now, task_id)
+                "UPDATE tasks SET status='done',finished_at=?,updated_at=? WHERE id=?",
+                (now, now, task_id),
             )
             connection.execute(
                 "INSERT INTO verification_evidence(task_id,evidence,created_at) VALUES(?,?,?) "
                 "ON CONFLICT(task_id) DO UPDATE SET evidence=excluded.evidence,created_at=excluded.created_at",
                 (task_id, json.dumps(evidence or {}, ensure_ascii=False), now),
             )
+            self._refresh_project_status(connection, int(row["project_id"]))
             connection.commit()
 
     def fail(self, task_id: int, worker_id: int, error: str, max_attempts: int = 3,
@@ -276,8 +317,9 @@ class Store:
             payload["last_error"] = error
             status = "manual_review" if int(row["attempts"]) >= max_attempts else "pending"
             connection.execute(
-                "UPDATE tasks SET status=?,worker_id=NULL,payload=?,updated_at=? WHERE id=?",
-                (status, json.dumps(payload, ensure_ascii=False), time.time(), task_id),
+                "UPDATE tasks SET status=?,worker_id=NULL,payload=?,finished_at=?,updated_at=? WHERE id=?",
+                (status, json.dumps(payload, ensure_ascii=False),
+                 time.time() if status == "manual_review" else None, time.time(), task_id),
             )
             connection.execute(
                 "INSERT INTO event_log(project_id,task_id,worker_id,level,message,screenshot_path,created_at) "
@@ -285,6 +327,8 @@ class Store:
                 (worker_id, "error" if status == "manual_review" else "warning", error,
                  screenshot_path, time.time(), task_id),
             )
+            project_id = connection.execute("SELECT project_id FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+            self._refresh_project_status(connection, int(project_id))
             connection.commit()
             return status
 
@@ -310,11 +354,15 @@ class Store:
                 "ON CONFLICT(task_id) DO UPDATE SET evidence=excluded.evidence,created_at=excluded.created_at",
                 (task_id, json.dumps(evidence, ensure_ascii=False), now),
             )
-            connection.execute("UPDATE tasks SET status='failed',updated_at=? WHERE id=?", (now, task_id))
+            connection.execute(
+                "UPDATE tasks SET status='failed',finished_at=?,updated_at=? WHERE id=?",
+                (now, now, task_id),
+            )
             connection.execute(
                 "INSERT INTO event_log(project_id,task_id,worker_id,level,message,created_at) VALUES(?,?,?,?,?,?)",
                 (row["project_id"], task_id, worker_id, "error", error, now),
             )
+            self._refresh_project_status(connection, int(row["project_id"]))
             connection.commit()
 
     def results(self, project_id: int, classification: str | None = None) -> list[dict[str, Any]]:
@@ -373,3 +421,116 @@ class Store:
                 "SELECT status,COUNT(*) count FROM tasks GROUP BY status"
             ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def update_project(self, project_id: int, *, priority: int | None = None,
+                       status: str | None = None) -> None:
+        allowed = {"draft", "queued", "running", "paused", "complete", "cancelled"}
+        if status is not None and status not in allowed:
+            raise ValueError(f"Geçersiz proje durumu: {status}")
+        if priority is None and status is None:
+            return
+        assignments: list[str] = []
+        parameters: list[Any] = []
+        if priority is not None:
+            assignments.append("priority=?"); parameters.append(int(priority))
+        if status is not None:
+            assignments.append("status=?"); parameters.append(status)
+        assignments.append("updated_at=?"); parameters.append(time.time())
+        parameters.append(project_id)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE projects SET {','.join(assignments)} WHERE id=?", parameters
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Proje bulunamadı.")
+
+    def cancel_pending(self, project_id: int) -> int:
+        now = time.time()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET status='cancelled',finished_at=?,updated_at=? "
+                "WHERE project_id=? AND status='pending'", (now, now, project_id),
+            )
+            connection.execute(
+                "UPDATE projects SET status='cancelled',updated_at=? WHERE id=?",
+                (now, project_id),
+            )
+            return cursor.rowcount
+
+    def retry_task(self, task_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT project_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            cursor = connection.execute(
+                "UPDATE tasks SET status='pending',worker_id=NULL,started_at=NULL,finished_at=NULL,"
+                "updated_at=? WHERE id=? AND status IN ('failed','manual_review','cancelled')",
+                (time.time(), task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Görev yeniden denenebilir durumda değil.")
+            self._refresh_project_status(connection, int(row["project_id"]))
+
+    def retry_tasks(self, project_id: int) -> int:
+        """Return failed, manual-review and cancelled tasks to the queue."""
+        now = time.time()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET status='pending',worker_id=NULL,started_at=NULL,finished_at=NULL,"
+                "updated_at=? WHERE project_id=? AND status IN ('failed','manual_review','cancelled')",
+                (now, project_id),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "UPDATE projects SET status='queued',updated_at=? WHERE id=?", (now, project_id)
+                )
+            return cursor.rowcount
+
+    def tasks(self, project_id: int, status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM tasks WHERE project_id=?"
+        parameters: list[Any] = [project_id]
+        if status is not None:
+            query += " AND status=?"; parameters.append(status)
+        query += " ORDER BY id"
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
+
+    def dashboard_stats(self, project_id: int | None = None) -> dict[str, Any]:
+        where = " WHERE project_id=?" if project_id is not None else ""
+        parameters: tuple[Any, ...] = (project_id,) if project_id is not None else ()
+        with self.connect() as connection:
+            counts = connection.execute(
+                "SELECT status,COUNT(*) count FROM tasks" + where + " GROUP BY status",
+                parameters,
+            ).fetchall()
+            completed = connection.execute(
+                "SELECT COUNT(*) count,MIN(started_at) first,MAX(finished_at) last "
+                "FROM tasks" + where + (" AND" if where else " WHERE") +
+                " status='done' AND started_at IS NOT NULL AND finished_at IS NOT NULL", parameters,
+            ).fetchone()
+            candidate_where = " WHERE project_id=?" if project_id is not None else ""
+            candidates = connection.execute(
+                "SELECT classification,COUNT(*) count FROM results" + candidate_where +
+                " GROUP BY classification", parameters,
+            ).fetchall()
+        count_map = {str(row["status"]): int(row["count"]) for row in counts}
+        done = int(completed["count"] or 0)
+        span = max(0.0, float(completed["last"] or 0) - float(completed["first"] or 0))
+        tests_per_hour = done * 3600 / span if done > 0 and span > 0 else 0.0
+        remaining = count_map.get("pending", 0) + count_map.get("running", 0)
+        eta_seconds = remaining * 3600 / tests_per_hour if tests_per_hour > 0 else None
+        return {
+            "counts": count_map, "tests_per_hour": tests_per_hour,
+            "eta_seconds": eta_seconds,
+            "candidates": {str(row["classification"]): int(row["count"]) for row in candidates},
+        }
+
+    def observed_seconds_per_test(self, project_id: int | None = None) -> float | None:
+        condition = " AND project_id=?" if project_id is not None else ""
+        parameters: tuple[Any, ...] = (project_id,) if project_id is not None else ()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT AVG(finished_at-started_at) average FROM tasks "
+                "WHERE status='done' AND started_at IS NOT NULL AND finished_at>started_at" + condition,
+                parameters,
+            ).fetchone()
+        return float(row["average"]) if row and row["average"] is not None else None

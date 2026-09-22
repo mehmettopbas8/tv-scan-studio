@@ -94,6 +94,9 @@ def classify(
         metrics.get("win_rate_pct", 0) >= criteria.get("min_win_rate_pct", 0),
         metrics.get("max_drawdown_pct", float("inf")) <= criteria.get("max_drawdown_pct", float("inf")),
         metrics.get("net_profit", 0) >= criteria.get("min_net_profit", float("-inf")),
+        metrics.get("max_daily_loss_pct", 0) <= criteria.get("max_daily_loss_pct", float("inf")),
+        metrics.get("max_total_loss_pct", metrics.get("max_drawdown_pct", 0))
+        <= criteria.get("max_total_loss_pct", float("inf")),
     )
     if not all(checks):
         return "elenmiş"

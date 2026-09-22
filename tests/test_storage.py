@@ -67,3 +67,37 @@ def test_only_verified_running_task_can_be_completed(tmp_path):
     results = store.results(project)
     assert results[0]["metrics"] == {"profit_factor": 1.7}
     assert results[0]["verified"] is True
+    assert store.project(project)["status"] == "complete"
+
+
+def test_project_control_retry_and_dashboard_stats(tmp_path):
+    store = Store(tmp_path / "studio.db")
+    project = store.create_project("Control", 'strategy("Control")')
+    store.update_project(project, priority=7, status="queued")
+    assert store.project(project)["priority"] == 7
+    store.enqueue(project, "one", {"symbol": "EURUSD"})
+    store.enqueue(project, "two", {"symbol": "GBPUSD"})
+    task = store.claim_next(1, [project])
+    store.fail(task.id, 1, "broken", max_attempts=1)
+    assert store.counts(project)["manual_review"] == 1
+    store.retry_task(task.id)
+    assert store.counts(project)["pending"] == 2
+    cancelled = store.cancel_pending(project)
+    assert cancelled == 2
+    stats = store.dashboard_stats(project)
+    assert stats["counts"] == {"cancelled": 2}
+    assert stats["tests_per_hour"] == 0
+    assert stats["eta_seconds"] is None
+
+
+def test_bulk_retry_returns_recoverable_project_tasks_to_queue(tmp_path):
+    store = Store(tmp_path / "studio.db")
+    project = store.create_project("Retry", 'strategy("Retry")')
+    store.enqueue(project, "one", {})
+    task = store.claim_next(2, [project])
+    assert task is not None
+    store.fail(task.id, 2, "broken", max_attempts=1)
+
+    assert store.retry_tasks(project) == 1
+    assert store.counts(project) == {"pending": 1}
+    assert store.project(project)["status"] == "queued"
