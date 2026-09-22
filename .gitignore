@@ -1,0 +1,9 @@
+.venv/
+.pytest_cache/
+.live-smoke-profile*/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.db
+screenshots/
