@@ -14,6 +14,24 @@ INPUT_START_RE = re.compile(
 SUPPORTED_KINDS = {"bool", "int", "float", "string", "timeframe", "session"}
 UNRESOLVED = object()
 
+
+def strategy_title(source: str) -> str:
+    match = STRATEGY_RE.search(source)
+    if not match:
+        raise ValueError("Yalnızca strategy() içeren Pine kodları desteklenir.")
+    body = _call_body(source, match.end() - 1)
+    if body is None:
+        raise ValueError("strategy() bildirimi tamamlanmamış.")
+    positional: list[str] = []
+    named: dict[str, str] = {}
+    for argument in _split_arguments(body):
+        name, value = _named_argument(argument)
+        (positional.append(value) if name is None else named.__setitem__(name, value))
+    title = _literal(named.get("title", positional[0] if positional else ""))
+    if title is UNRESOLVED or not isinstance(title, str) or not title:
+        raise ValueError("strategy() başlığı kesin olarak okunamadı.")
+    return title
+
 @dataclass(frozen=True, slots=True)
 class PineInput:
     variable: str

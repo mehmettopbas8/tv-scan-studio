@@ -31,6 +31,7 @@ class StrategySnapshot:
     inputs: dict[str, Any]
     metrics: dict[str, Any] | None
     period: dict[str, Any] | None
+    trades: tuple[dict[str, Any], ...] = ()
 
 
 class TradingViewDriver(Protocol):
@@ -59,11 +60,14 @@ class GncZihinDriver:
         return list(self._motor.bul_hedefler())
 
     def strategies(self, target_id: str) -> list[dict[str, Any]]:
-        result = self._motor._eval(target_id, """(()=>{
+        result = self._motor._eval(target_id, r"""(()=>{
           const c=TradingViewApi._activeChartWidgetWV.value();
           return c._chartWidget.model().dataSources()
             .filter(x=>typeof x.reportData==='function')
-            .map(x=>({id:x.id?.(),name:x.name?.(),status:x._status?.value?.()}));
+            .map(x=>{const iv=c.getStudyById(x.id())?.getInputValues?.()||[];
+              return {id:x.id?.(),name:x.name?.(),status:x._status?.value?.(),
+                input_ids:iv.map(v=>v.id).filter(id=>/^in_\d+$/.test(id)),
+                pine_id:iv.find(v=>v.id==='pineId')?.value||null};});
         })()""")
         return result if isinstance(result, list) else []
 
@@ -99,7 +103,7 @@ class GncZihinDriver:
               metrics:a?{trades:a.totalTrades,profit_factor:a.profitFactor,
                 win_rate_pct:a.percentProfitable*100,max_drawdown_pct:p.maxStrategyDrawDownPercent*100,
                 net_profit:a.netProfit,net_profit_pct:a.netProfitPercent*100}:null,
-              period:r?.settings||null};
+              period:r?.settings||null,trades:Array.isArray(r?.trades)?r.trades:[]};
         """)
         status = data.get("status") or {}
         return StrategySnapshot(
@@ -108,6 +112,7 @@ class GncZihinDriver:
             inputs={item["id"]: item.get("value") for item in data.get("inputs", [])
                     if re.fullmatch(r"in_\d+", str(item.get("id", "")))},
             metrics=data.get("metrics"), period=data.get("period"),
+            trades=tuple(data.get("trades") or ()),
         )
 
     def configure(self, target_id: str, study_id: str, symbol: str, timeframe: str, inputs: dict[str, Any]) -> None:
@@ -123,6 +128,13 @@ class GncZihinDriver:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._motor.screenshot(target_id, str(path))
         return str(path)
+
+
+def strategy_structure_matches(strategy: dict[str, Any], expected_title: str,
+                               expected_input_count: int) -> bool:
+    expected_ids = {f"in_{index}" for index in range(expected_input_count)}
+    observed_ids = set(strategy.get("input_ids") or ())
+    return str(strategy.get("name") or "").strip() == expected_title.strip() and observed_ids == expected_ids
 
 
 def symbol_matches(requested: str, observed: str) -> bool:
@@ -164,7 +176,7 @@ def wait_for_verified_result(
     last: StrategySnapshot | None = None
     while time.monotonic() < deadline:
         last = driver.snapshot(target_id, study_id)
-        state = json.dumps([last.metrics, last.period], sort_keys=True)
+        state = json.dumps([last.metrics, last.period, len(last.trades), last.trades[-1] if last.trades else None], sort_keys=True)
         requested_tf = {"1H": "60", "4H": "240", "1D": "D", "1W": "W"}.get(expected["timeframe"], expected["timeframe"])
         period_matches = date_range_matches(expected.get("date_range") or {}, last.period)
         valid = (

@@ -1,6 +1,6 @@
 import pytest
 
-from tv_scan_studio.pine import parse_strategy_inputs
+from tv_scan_studio.pine import parse_strategy_inputs, strategy_title
 
 
 SOURCE = '''
@@ -26,6 +26,11 @@ def test_parses_supported_inputs():
 def test_rejects_indicator():
     with pytest.raises(ValueError, match="strategy"):
         parse_strategy_inputs('indicator("Example")\nlength=input.int(20)')
+
+
+def test_extracts_strategy_title():
+    assert strategy_title('strategy("My Strategy", overlay=true)') == "My Strategy"
+    assert strategy_title('strategy(title="Named", overlay=false)') == "Named"
 
 
 def test_parses_multiline_named_arguments_and_metadata():

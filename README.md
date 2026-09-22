@@ -2,7 +2,7 @@
 
 TradingView Desktop üzerindeki Pine stratejilerinin input kombinasyonlarını yerel olarak taramak için Windows masaüstü uygulaması.
 
-## MVP durumu
+## Ürün özellikleri
 
 - Pine `strategy()` doğrulama ve temel input ayrıştırma
 - Lazy kombinasyon üretimi ve önizleme sayısı
@@ -16,6 +16,16 @@ TradingView Desktop üzerindeki Pine stratejilerinin input kombinasyonlarını y
 - Dashboard, görev planlama, worker dağıtımı, sonuç/olay ekranı
 - Başarılı preset filtreleme, yan yana tablo karşılaştırması ve CSV
 - Normal ve Microsoft Store TradingView Desktop keşfi
+- Tek CDP 9222 oturumu içinde güvenli chart tabı çoğaltma
+- Worker başına bağımsız proje atama, proje önceliği, pause/cancel/retry
+- CPU/RAM worker önerisi, 2/4/8/16 projeksiyonu, test/saat ve ETA
+- Sabit/liste/aralık/exclude input taraması ve FTMO sembol profilleri
+- Pozisyon, risk ve maliyet varsayımları; gerçek `in_N` eşlemesi ve özel şablonlar
+- Komşu değer, maliyet stresi ve alternatif sağlayıcı aşamalı doğrulaması
+- İşlem bazlı günlük P/L, FTMO kayıp, seri, süre, long/short, session ve yoğunlaşma analizi
+- Equity/drawdown grafiği, günlük P/L görünümü, PDF raporu ve doğrulanmış CSV
+- Checksum doğrulamalı SQLite + Pine kaynak yedeği
+- Windows bildirimleri ve tamamen yerel ayarlar; telemetri/kullanıcı hesabı yok
 
 ## Geliştirme
 
@@ -36,7 +46,13 @@ python -m venv .venv
 ZIP ve SHA-256 checksum üretir. İlk sürüm imzasızdır; Windows SmartScreen
 uyarısında dosyanın GitHub Release checksum değeri doğrulanmalıdır.
 
-MVP mevcut TradingView taramalarından ayrı çalışır. Uygulama açılışta hiçbir
+Portable paketin SQLite ve Türkçe PDF bağımlılıklarını GUI açmadan doğrulamak için:
+
+```powershell
+dist\TV-Scan-Studio\TV-Scan-Studio.exe --self-test
+```
+
+Uygulama mevcut TradingView taramalarından ayrı çalışır. Uygulama açılışta hiçbir
 grafiği veya layout'u değiştirmez; CDP otomasyonu yalnızca kullanıcı workerları
 başlattığında devreye girer.
 
@@ -47,6 +63,13 @@ kapanırsa yarım kalan görevler yeniden bekleme kuyruğuna alınır.
 
 Temel kriterleri geçen tek ölçüm `hassas` kabul edilir. `dayanıklı` sınıfı için
 komşu değer, maliyet stresi ve farklı sağlayıcı kontrollerinin üçü de gerekir.
+
+TradingView Desktop yalnızca `9222` portuyla açılır. Ek workerlar ikinci bir
+port veya ikinci hesap oturumu başlatmaz; uygulama aynı CDP profili içinde yeni
+chart tabları açar. Worker çalıştırmadan önce Pine başlığı ve input yapısı
+eşleşmeli, ilk kullanımda kullanıcı kalıcı `pine_id` ve yerel Pine SHA-256
+eşlemesini onaylamalıdır. Kaynak değişirse worker kilidi yeniden devreye girer;
+uygulama belirsiz bir grafiğe otomatik kod yapıştırmaz veya mevcut çalışmayı gizlemez.
 
 Lisans: AGPL-3.0-only.
 

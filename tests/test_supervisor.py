@@ -3,7 +3,7 @@ import threading
 import pytest
 
 from tv_scan_studio.storage import Store
-from tv_scan_studio.supervisor import WorkerAssignment, WorkerSupervisor
+from tv_scan_studio.supervisor import WorkerAssignment, WorkerState, WorkerSupervisor
 from tv_scan_studio.tradingview import StrategySnapshot
 
 
@@ -43,3 +43,21 @@ def test_supervisor_rejects_shared_target(tmp_path):
     supervisor = WorkerSupervisor(Store(tmp_path / "studio.db"), ParallelFakeDriver())
     with pytest.raises(ValueError, match="bağımsız"):
         supervisor.start([WorkerAssignment(1, "target-1", (1,)), WorkerAssignment(2, "target-1", (1,))])
+
+
+def test_supervisor_restarts_terminal_failed_worker_at_most_three_times(tmp_path, monkeypatch):
+    store = Store(tmp_path / "studio.db")
+    supervisor = WorkerSupervisor(store, ParallelFakeDriver(), heartbeat_seconds=0)
+    assignment = WorkerAssignment(1, "target-1", ())
+    supervisor.states[1] = state = WorkerState(1, "target-1", status="failed")
+    supervisor._assignments[1] = (assignment, True)
+
+    started = []
+    monkeypatch.setattr(supervisor, "_start_thread", lambda item, stop: started.append((item, stop)))
+    for expected in range(1, 4):
+        state.status = "failed"
+        assert supervisor.restart_failed() == [1]
+        assert state.restarts == expected
+    state.status = "failed"
+    assert supervisor.restart_failed() == []
+    assert len(started) == 3

@@ -67,6 +67,19 @@ CREATE TABLE IF NOT EXISTS event_log (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS event_log_created_idx ON event_log(created_at DESC);
+CREATE TABLE IF NOT EXISTS validation_links (
+    parent_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    child_task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    passed INTEGER CHECK(passed IN (0, 1)),
+    created_at REAL NOT NULL,
+    PRIMARY KEY(parent_task_id, child_task_id)
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -162,8 +175,13 @@ class Store:
 
     def save_settings(self, project_id: int, settings: dict[str, Any]) -> None:
         now = time.time()
-        encoded = json.dumps(settings, ensure_ascii=False, sort_keys=True)
         with self.connect() as connection:
+            current = connection.execute(
+                "SELECT settings FROM project_settings WHERE project_id=?", (project_id,)
+            ).fetchone()
+            merged = json.loads(current["settings"]) if current else {}
+            merged.update(settings)
+            encoded = json.dumps(merged, ensure_ascii=False, sort_keys=True)
             connection.execute(
                 "INSERT INTO project_settings(project_id,settings,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(project_id) DO UPDATE SET settings=excluded.settings,updated_at=excluded.updated_at",
@@ -179,6 +197,21 @@ class Store:
                 "SELECT settings FROM project_settings WHERE project_id=?", (project_id,)
             ).fetchone()
         return json.loads(row["settings"]) if row else None
+
+    def save_app_settings(self, settings: dict[str, Any]) -> None:
+        now = time.time()
+        with self.connect() as connection:
+            for key, value in settings.items():
+                connection.execute(
+                    "INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (str(key), json.dumps(value, ensure_ascii=False), now),
+                )
+
+    def app_settings(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT key,value FROM app_settings").fetchall()
+        return {str(row["key"]): json.loads(row["value"]) for row in rows}
 
     def log_event(self, level: str, message: str, *, project_id: int | None = None,
                   task_id: int | None = None, worker_id: int | None = None,
@@ -234,7 +267,7 @@ class Store:
             row = connection.execute(
                 "SELECT t.id,t.project_id,t.task_key,t.payload,t.attempts "
                 "FROM tasks t JOIN projects p ON p.id=t.project_id "
-                "WHERE t.status='pending'" + assignment_filter + " "
+                "WHERE t.status='pending' AND p.status NOT IN ('paused','cancelled')" + assignment_filter + " "
                 "ORDER BY p.priority DESC,t.id LIMIT 1",
                 parameters,
             ).fetchone()
@@ -297,6 +330,7 @@ class Store:
                 "ON CONFLICT(task_id) DO UPDATE SET evidence=excluded.evidence,created_at=excluded.created_at",
                 (task_id, json.dumps(evidence or {}, ensure_ascii=False), now),
             )
+            self._resolve_validation(connection, task_id, classification != "elenmiş")
             self._refresh_project_status(connection, int(row["project_id"]))
             connection.commit()
 
@@ -328,6 +362,8 @@ class Store:
                  screenshot_path, time.time(), task_id),
             )
             project_id = connection.execute("SELECT project_id FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+            if status == "manual_review":
+                self._resolve_validation(connection, task_id, False)
             self._refresh_project_status(connection, int(project_id))
             connection.commit()
             return status
@@ -362,12 +398,13 @@ class Store:
                 "INSERT INTO event_log(project_id,task_id,worker_id,level,message,created_at) VALUES(?,?,?,?,?,?)",
                 (row["project_id"], task_id, worker_id, "error", error, now),
             )
+            self._resolve_validation(connection, task_id, False)
             self._refresh_project_status(connection, int(row["project_id"]))
             connection.commit()
 
     def results(self, project_id: int, classification: str | None = None) -> list[dict[str, Any]]:
         query = (
-            "SELECT t.task_key,t.payload,r.metrics,r.classification,r.verified,r.created_at,e.evidence "
+            "SELECT t.id task_id,t.task_key,t.payload,r.metrics,r.classification,r.verified,r.created_at,e.evidence "
             "FROM results r JOIN tasks t ON t.id=r.task_id "
             "LEFT JOIN verification_evidence e ON e.task_id=r.task_id WHERE r.project_id=?"
         )
@@ -380,6 +417,7 @@ class Store:
             rows = connection.execute(query, parameters).fetchall()
         return [
             {
+                "task_id": int(row["task_id"]),
                 "task_key": str(row["task_key"]),
                 "payload": json.loads(row["payload"]),
                 "metrics": json.loads(row["metrics"]),
@@ -390,6 +428,72 @@ class Store:
             }
             for row in rows
         ]
+
+    def enqueue_validation(self, parent_task_id: int, stage: str,
+                           task_key: str, payload: dict[str, Any]) -> bool:
+        if stage not in {"neighbor", "cost_stress", "provider_check"}:
+            raise ValueError(f"Geçersiz doğrulama aşaması: {stage}")
+        now = time.time()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            parent = connection.execute(
+                "SELECT project_id FROM tasks WHERE id=? AND status='done'", (parent_task_id,)
+            ).fetchone()
+            if parent is None:
+                connection.rollback(); raise ValueError("Yalnızca tamamlanmış görev doğrulanabilir.")
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO tasks(project_id,task_key,payload,updated_at) VALUES(?,?,?,?)",
+                (parent["project_id"], task_key, json.dumps(payload, ensure_ascii=False), now),
+            )
+            child = connection.execute(
+                "SELECT id FROM tasks WHERE project_id=? AND task_key=?",
+                (parent["project_id"], task_key),
+            ).fetchone()
+            connection.execute(
+                "INSERT OR IGNORE INTO validation_links(parent_task_id,child_task_id,stage,created_at) "
+                "VALUES(?,?,?,?)", (parent_task_id, child["id"], stage, now),
+            )
+            self._refresh_project_status(connection, int(parent["project_id"]))
+            connection.commit()
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _resolve_validation(connection: sqlite3.Connection, child_task_id: int, passed: bool) -> None:
+        link = connection.execute(
+            "SELECT parent_task_id FROM validation_links WHERE child_task_id=?", (child_task_id,)
+        ).fetchone()
+        if link is None:
+            return
+        parent_id = int(link["parent_task_id"])
+        connection.execute(
+            "UPDATE validation_links SET passed=? WHERE child_task_id=?", (int(passed), child_task_id)
+        )
+        rows = connection.execute(
+            "SELECT stage,COUNT(*) total,SUM(CASE WHEN passed=1 THEN 1 ELSE 0 END) passed_count,"
+            "SUM(CASE WHEN passed=0 THEN 1 ELSE 0 END) failed_count,"
+            "SUM(CASE WHEN passed IS NULL THEN 1 ELSE 0 END) pending_count "
+            "FROM validation_links WHERE parent_task_id=? GROUP BY stage", (parent_id,)
+        ).fetchall()
+        stages = {str(row["stage"]): dict(row) for row in rows}
+        evidence_row = connection.execute(
+            "SELECT evidence FROM verification_evidence WHERE task_id=?", (parent_id,)
+        ).fetchone()
+        evidence = json.loads(evidence_row["evidence"]) if evidence_row else {}
+        gate_names = {"neighbor": "neighbor_passed", "cost_stress": "cost_stress_passed",
+                      "provider_check": "provider_check_passed"}
+        validation = evidence.setdefault("validation", {})
+        for stage, gate in gate_names.items():
+            data = stages.get(stage)
+            validation[gate] = bool(data and data["pending_count"] == 0 and data["failed_count"] == 0)
+        connection.execute(
+            "UPDATE verification_evidence SET evidence=?,created_at=? WHERE task_id=?",
+            (json.dumps(evidence, ensure_ascii=False), time.time(), parent_id),
+        )
+        durable = all(validation.get(gate) is True for gate in gate_names.values())
+        connection.execute(
+            "UPDATE results SET classification=? WHERE task_id=? AND verified=1",
+            ("dayanıklı" if durable else "hassas", parent_id),
+        )
 
     def counts(self, project_id: int) -> dict[str, int]:
         with self.connect() as connection:
@@ -403,7 +507,12 @@ class Store:
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT p.id,p.name,p.status,p.priority,p.created_at,p.updated_at,"
-                "COUNT(t.id) task_count FROM projects p LEFT JOIN tasks t ON t.project_id=p.id "
+                "COUNT(t.id) task_count,"
+                "SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) done_count,"
+                "SUM(CASE WHEN t.status='pending' THEN 1 ELSE 0 END) pending_count,"
+                "SUM(CASE WHEN t.status='running' THEN 1 ELSE 0 END) running_count,"
+                "SUM(CASE WHEN t.status IN ('failed','manual_review') THEN 1 ELSE 0 END) issue_count "
+                "FROM projects p LEFT JOIN tasks t ON t.project_id=p.id "
                 "GROUP BY p.id ORDER BY p.priority DESC,p.updated_at DESC"
             ).fetchall()
         return [dict(row) for row in rows]

@@ -22,6 +22,8 @@ class ScanPlan:
     costs: dict[str, Any] = field(default_factory=dict)
     criteria: dict[str, Any] = field(default_factory=dict)
     timeout: float = 75
+    poll_interval: float = 0.7
+    stable_reads: int = 3
 
     def validate(self) -> None:
         if not self.study_id.strip():
@@ -34,6 +36,8 @@ class ScanPlan:
             raise ValueError("Her taranan input en az bir değer içermelidir.")
         if self.timeout <= 0:
             raise ValueError("Zaman aşımı sıfırdan büyük olmalıdır.")
+        if self.poll_interval <= 0 or self.stable_reads < 1:
+            raise ValueError("Doğrulama poll süresi pozitif, stabil okuma en az 1 olmalıdır.")
 
     @property
     def task_count(self) -> int:
@@ -52,6 +56,8 @@ class ScanPlan:
             timeframes=tuple(value["timeframes"]), input_values=value["input_values"],
             date_range=value.get("date_range", {}), costs=value.get("costs", {}),
             criteria=value.get("criteria", {}), timeout=float(value.get("timeout", 75)),
+            poll_interval=float(value.get("poll_interval", 0.7)),
+            stable_reads=int(value.get("stable_reads", 3)),
         )
 
 
@@ -64,6 +70,7 @@ def iter_tasks(plan: ScanPlan) -> Iterator[tuple[str, dict[str, Any]]]:
                     "study_id": plan.study_id, "symbol": symbol, "timeframe": timeframe,
                     "inputs": inputs, "date_range": plan.date_range, "costs": plan.costs,
                     "criteria": plan.criteria, "timeout": plan.timeout,
+                    "poll_interval": plan.poll_interval, "stable_reads": plan.stable_reads,
                 }
                 canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 task_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()

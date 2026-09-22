@@ -7,19 +7,21 @@ import sys
 import json
 from pathlib import Path
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
-from .pine import parse_strategy_inputs
+from .pine import parse_strategy_inputs, strategy_title
 from .planner import ScanPlan, enqueue_plan
 from .export import export_results_csv
 from .backup import create_backup, verify_backup
 from .resources import project_worker_throughput, recommend_workers, system_snapshot
 from .supervisor import WorkerAssignment, WorkerSupervisor
-from .tradingview import GncZihinDriver
-from .windows import cdp_healthy, find_tradingview_executables, launch_with_cdp
+from .tradingview import GncZihinDriver, strategy_structure_matches
+from .windows import cdp_healthy, find_tradingview_executables, launch_with_cdp, open_chart_tabs
 from .storage import Store
 from .scan_values import parse_scan_values
 from .profiles import COST_SCENARIOS, FTMO_SYMBOL_PROFILES, apply_cost_multiplier
+from .report import export_project_pdf
+from .validation import enqueue_followups
 
 
 STYLE = """
@@ -45,6 +47,42 @@ QTableWidget { gridline-color:#1e314b; }
 """
 
 
+class CurveChart(QtWidgets.QWidget):
+    def __init__(self, points, parent=None):
+        super().__init__(parent)
+        self.points = points
+        self.setMinimumHeight(190)
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        area = self.rect().adjusted(42, 18, -18, -28)
+        painter.fillRect(self.rect(), QtGui.QColor("#0f1b2e"))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#29405f"), 1))
+        painter.drawRect(area)
+        if len(self.points) < 2:
+            painter.setPen(QtGui.QColor("#8099b8")); painter.drawText(area, QtCore.Qt.AlignCenter, "Grafik için yeterli işlem yok")
+            return
+        equities = [float(point.get("equity") or 0) for point in self.points]
+        drawdowns = [float(point.get("drawdown") or 0) for point in self.points]
+        low, high = min(equities), max(equities)
+        span = high - low or 1
+        dd_high = max(drawdowns) or 1
+
+        def path(values, minimum, value_span):
+            result = QtGui.QPainterPath()
+            for index, value in enumerate(values):
+                x = area.left() + index * area.width() / (len(values) - 1)
+                y = area.bottom() - (value - minimum) / value_span * area.height()
+                (result.moveTo if index == 0 else result.lineTo)(x, y)
+            return result
+
+        painter.setPen(QtGui.QPen(QtGui.QColor("#4ca6ff"), 2)); painter.drawPath(path(equities, low, span))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#ff7f7f"), 1.5)); painter.drawPath(path(drawdowns, 0, dd_high))
+        painter.setPen(QtGui.QColor("#9fb4ce")); painter.drawText(8, 18, "Equity")
+        painter.setPen(QtGui.QColor("#ff7f7f")); painter.drawText(8, 35, "DD")
+
+
 def data_path() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "TVScanStudio"
     return base / "studio.db"
@@ -62,6 +100,7 @@ class StudioWindow:
         self.window.resize(1240, 780)
         self._last_dashboard_counts = None
         self._notified_worker_errors = set()
+        self._notified_worker_restarts = set()
         self.tray = QtWidgets.QSystemTrayIcon(
             self.window.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon), self.window
         )
@@ -79,11 +118,13 @@ class StudioWindow:
         self.scan_setup = self._scan_setup_page()
         self.workers_page = self._workers_page()
         self.results_page = self._results_page()
+        self.settings_page = self._settings_page()
         self.pages.addWidget(self.dashboard)
         self.pages.addWidget(self.new_project)
         self.pages.addWidget(self.scan_setup)
         self.pages.addWidget(self.workers_page)
         self.pages.addWidget(self.results_page)
+        self.pages.addWidget(self.settings_page)
         layout.addWidget(self.pages, 1)
         self.window.setCentralWidget(root)
         self.worker_timer = QtCore.QTimer(self.window)
@@ -101,7 +142,7 @@ class StudioWindow:
         box.addWidget(Q.QLabel("Yerel strateji laboratuvarı", objectName="tagline"))
         group = Q.QButtonGroup(rail)
         group.setExclusive(True)
-        for index, label in enumerate(("Tarama masası", "Yeni proje", "Tarama ayarları", "Worker dağıtımı", "Sonuçlar ve hatalar")):
+        for index, label in enumerate(("Tarama masası", "Yeni proje", "Tarama ayarları", "Worker dağıtımı", "Sonuçlar ve hatalar", "Ayarlar")):
             button = Q.QPushButton(label)
             button.setProperty("nav", True)
             button.setCheckable(True)
@@ -151,8 +192,8 @@ class StudioWindow:
         box.addLayout(operational)
         box.addSpacing(20)
         box.addWidget(Q.QLabel("Projeler", objectName="subtitle"))
-        self.project_table = Q.QTableWidget(0, 5)
-        self.project_table.setHorizontalHeaderLabels(["ID", "Proje", "Durum", "Öncelik", "Görev"])
+        self.project_table = Q.QTableWidget(0, 6)
+        self.project_table.setHorizontalHeaderLabels(["ID", "Proje", "Durum", "Öncelik", "Görev", "İlerleme"])
         self.project_table.horizontalHeader().setStretchLastSection(True)
         self.project_table.setEditTriggers(Q.QAbstractItemView.NoEditTriggers)
         self.project_table.setSelectionBehavior(Q.QAbstractItemView.SelectRows)
@@ -166,6 +207,31 @@ class StudioWindow:
         for widget in (self.project_priority, self.project_state, apply_project, cancel, retry): controls.addWidget(widget)
         controls.addStretch(); box.addLayout(controls)
         self.dashboard_status = Q.QLabel("", objectName="status"); box.addWidget(self.dashboard_status)
+        return page
+
+    def _settings_page(self):
+        Q = self.QtWidgets
+        page = Q.QWidget(); box = Q.QVBoxLayout(page); box.setContentsMargins(34, 28, 34, 28)
+        box.addWidget(self._page_header("Ayarlar", "Yerel doğrulama ve bildirim seçenekleri"))
+        form = Q.QFormLayout()
+        self.default_timeout = Q.QDoubleSpinBox(); self.default_timeout.setRange(5, 600); self.default_timeout.setValue(75); self.default_timeout.setSuffix(" sn")
+        self.default_poll = Q.QDoubleSpinBox(); self.default_poll.setRange(.05, 10); self.default_poll.setDecimals(2); self.default_poll.setValue(.7); self.default_poll.setSuffix(" sn")
+        self.default_stable = Q.QSpinBox(); self.default_stable.setRange(1, 10); self.default_stable.setValue(3)
+        self.notifications_enabled = Q.QCheckBox("Windows bildirimlerini göster"); self.notifications_enabled.setChecked(True)
+        port = Q.QLineEdit("9222"); port.setReadOnly(True)
+        database = Q.QLineEdit(str(self.store.path)); database.setReadOnly(True)
+        form.addRow("Tek CDP portu", port); form.addRow("Yerel veritabanı", database)
+        form.addRow("Görev zaman aşımı", self.default_timeout); form.addRow("Poll aralığı", self.default_poll)
+        form.addRow("Stabil okuma sayısı", self.default_stable); form.addRow("Bildirimler", self.notifications_enabled)
+        box.addLayout(form)
+        save = Q.QPushButton("Ayarları kaydet", objectName="primary"); save.clicked.connect(self.save_application_settings)
+        box.addWidget(save); self.settings_status = Q.QLabel("Telemetri ve bulut bağlantısı kapalıdır.", objectName="status")
+        box.addWidget(self.settings_status); box.addStretch()
+        settings = self.store.app_settings()
+        self.default_timeout.setValue(float(settings.get("timeout", 75)))
+        self.default_poll.setValue(float(settings.get("poll_interval", .7)))
+        self.default_stable.setValue(int(settings.get("stable_reads", 3)))
+        self.notifications_enabled.setChecked(bool(settings.get("notifications", True)))
         return page
 
     def _scan_setup_page(self):
@@ -209,13 +275,22 @@ class StudioWindow:
         self.risk_value = Q.QDoubleSpinBox(); self.risk_value.setRange(0, 1_000_000_000); self.risk_value.setValue(1); self.risk_value.setPrefix("Risk ")
         self.risk_mode = Q.QComboBox(); self.risk_mode.addItems(["yüzde", "sabit"])
         self.cost_scenario = Q.QComboBox(); self.cost_scenario.addItems(COST_SCENARIOS.keys())
+        self.cost_templates = dict(self.store.app_settings().get("cost_templates", {}))
+        self.cost_scenario.addItems(self.cost_templates.keys())
+        self.cost_scenario.currentTextChanged.connect(self.apply_cost_template)
+        save_cost = Q.QPushButton("Maliyet şablonunu kaydet"); save_cost.clicked.connect(self.save_cost_template)
         for widget in (self.initial_capital, self.position_size, self.commission, self.spread, self.slippage, self.risk_mode, self.risk_value, self.cost_scenario): costs.addWidget(widget)
+        costs.addWidget(save_cost)
         form.addRow("TradingView maliyetleri", costs)
         cost_ids = Q.QHBoxLayout()
         self.capital_input_id = Q.QLineEdit(); self.capital_input_id.setPlaceholderText("Sermaye in_N (opsiyonel)")
+        self.position_input_id = Q.QLineEdit(); self.position_input_id.setPlaceholderText("Pozisyon in_N")
         self.commission_input_id = Q.QLineEdit(); self.commission_input_id.setPlaceholderText("Komisyon in_N (opsiyonel)")
+        self.spread_input_id = Q.QLineEdit(); self.spread_input_id.setPlaceholderText("Spread in_N")
         self.slippage_input_id = Q.QLineEdit(); self.slippage_input_id.setPlaceholderText("Slippage in_N (opsiyonel)")
-        for widget in (self.capital_input_id, self.commission_input_id, self.slippage_input_id): cost_ids.addWidget(widget)
+        self.risk_input_id = Q.QLineEdit(); self.risk_input_id.setPlaceholderText("Risk in_N")
+        for widget in (self.capital_input_id, self.position_input_id, self.commission_input_id,
+                       self.spread_input_id, self.slippage_input_id, self.risk_input_id): cost_ids.addWidget(widget)
         form.addRow("Maliyet input eşlemesi", cost_ids)
         box.addLayout(form)
         box.addWidget(Q.QLabel("Input değerleri", objectName="subtitle"))
@@ -243,9 +318,11 @@ class StudioWindow:
         self.result_project = Q.QComboBox(); self.result_project.currentIndexChanged.connect(self.refresh_results)
         self.result_filter = Q.QComboBox(); self.result_filter.addItems(["Tümü", "dayanıklı", "hassas", "elenmiş", "geçersiz"]); self.result_filter.currentIndexChanged.connect(self.refresh_results)
         export = Q.QPushButton("CSV dışa aktar", objectName="primary"); export.clicked.connect(self.export_current_results)
+        export_pdf = Q.QPushButton("PDF raporu"); export_pdf.clicked.connect(self.export_current_report)
         compare = Q.QPushButton("Seçilenleri karşılaştır"); compare.clicked.connect(self.compare_selected_results)
+        validate = Q.QPushButton("Aşamalı doğrula"); validate.clicked.connect(self.validate_selected_results)
         retry = Q.QPushButton("Hatalıları yeniden sırala"); retry.clicked.connect(self.retry_result_project)
-        controls.addWidget(self.result_project); controls.addWidget(self.result_filter); controls.addWidget(export); controls.addWidget(compare); controls.addWidget(retry); controls.addStretch()
+        controls.addWidget(self.result_project); controls.addWidget(self.result_filter); controls.addWidget(export); controls.addWidget(export_pdf); controls.addWidget(compare); controls.addWidget(validate); controls.addWidget(retry); controls.addStretch()
         box.addLayout(controls)
         self.results_table = Q.QTableWidget(0, 7)
         self.results_table.setHorizontalHeaderLabels(["Görev", "Sembol", "TF", "Sınıf", "İşlem", "PF", "Maks. DD"])
@@ -253,6 +330,7 @@ class StudioWindow:
         self.results_table.setEditTriggers(Q.QAbstractItemView.NoEditTriggers)
         self.results_table.setSelectionBehavior(Q.QAbstractItemView.SelectRows)
         self.results_table.setSelectionMode(Q.QAbstractItemView.ExtendedSelection)
+        self.results_table.doubleClicked.connect(self.show_result_details)
         box.addWidget(self.results_table, 2)
         box.addWidget(Q.QLabel("Son olaylar", objectName="subtitle"))
         self.events_table = Q.QTableWidget(0, 5)
@@ -287,8 +365,13 @@ class StudioWindow:
         box.addLayout(resource_row)
         note = Q.QLabel("TradingView Desktop CDP 9222 ile açık olmalı. Her seçili satır farklı bir chart target olmalıdır.")
         note.setWordWrap(True); note.setObjectName("subtitle"); box.addWidget(note)
-        self.worker_table = Q.QTableWidget(0, 6)
-        self.worker_table.setHorizontalHeaderLabels(["Kullan", "Worker", "Target", "Strategy ID", "Durum", "Tamamlanan"])
+        tab_row = Q.QHBoxLayout()
+        self.new_tab_count = Q.QSpinBox(); self.new_tab_count.setRange(1, 16); self.new_tab_count.setValue(2); self.new_tab_count.setPrefix("Yeni tab ")
+        open_tabs = Q.QPushButton("9222 içinde tabları aç"); open_tabs.clicked.connect(self.create_worker_tabs)
+        bind = Q.QPushButton("Seçili kaynağı projeye bağla"); bind.clicked.connect(self.bind_selected_strategy)
+        tab_row.addWidget(self.new_tab_count); tab_row.addWidget(open_tabs); tab_row.addWidget(bind); tab_row.addStretch(); box.addLayout(tab_row)
+        self.worker_table = Q.QTableWidget(0, 7)
+        self.worker_table.setHorizontalHeaderLabels(["Kullan", "Worker", "Target", "Proje", "Strategy ID", "Durum", "Tamamlanan"])
         self.worker_table.horizontalHeader().setStretchLastSection(True)
         box.addWidget(self.worker_table, 1)
         actions = Q.QHBoxLayout()
@@ -316,6 +399,15 @@ class StudioWindow:
         except Exception as exc:
             self.worker_status.setStyleSheet("color:#ff8e8e"); self.worker_status.setText(str(exc))
 
+    def create_worker_tabs(self):
+        try:
+            targets = open_chart_tabs(self.new_tab_count.value(), port=9222)
+            self.worker_status.setStyleSheet("color:#64d6a1")
+            self.worker_status.setText(f"9222 oturumunda {len(targets)} yeni chart tabı açıldı")
+            QtCore.QTimer.singleShot(1200, self.discover_targets)
+        except Exception as exc:
+            self.worker_status.setStyleSheet("color:#ff8e8e"); self.worker_status.setText(str(exc))
+
     def _new_project_page(self):
         Q = self.QtWidgets
         page = Q.QWidget()
@@ -340,8 +432,8 @@ class StudioWindow:
         box.addLayout(controls)
         self.project_status = Q.QLabel("Pine kodu bekleniyor", objectName="status")
         box.addWidget(self.project_status)
-        self.input_table = Q.QTableWidget(0, 6)
-        self.input_table.setHorizontalHeaderLabels(["Değişken", "Başlık", "Tür", "Varsayılan", "Seçenekler", "Durum"])
+        self.input_table = Q.QTableWidget(0, 9)
+        self.input_table.setHorizontalHeaderLabels(["Değişken", "Başlık", "Tür", "Varsayılan", "Seçenekler", "Min/Max/Adım", "Grup", "Tooltip", "Durum"])
         self.input_table.horizontalHeader().setStretchLastSection(True)
         box.addWidget(self.input_table, 1)
         return page
@@ -357,6 +449,14 @@ class StudioWindow:
         elif index == 4:
             self.refresh_project_selectors(); self.refresh_results()
 
+    def save_application_settings(self):
+        self.store.save_app_settings({
+            "timeout": self.default_timeout.value(), "poll_interval": self.default_poll.value(),
+            "stable_reads": self.default_stable.value(), "notifications": self.notifications_enabled.isChecked(),
+            "cdp_port": 9222,
+        })
+        self.settings_status.setText("Ayarlar yerel veritabanına kaydedildi.")
+
     def analyze_source(self):
         Q = self.QtWidgets
         try:
@@ -367,7 +467,10 @@ class StudioWindow:
             return
         self.input_table.setRowCount(len(inputs))
         for row, item in enumerate(inputs):
-            values = (item.variable, item.title, item.kind, repr(item.default), repr(item.options or ""), "Manuel tanım" if item.manual_definition_required else "Hazır")
+            limits = "/".join("—" if value is None else str(value) for value in (item.minimum, item.maximum, item.step))
+            values = (item.variable, item.title, item.kind, repr(item.default), repr(item.options or ""),
+                      limits, item.group or "", item.tooltip or "",
+                      "Manuel tanım" if item.manual_definition_required else "Hazır")
             for column, value in enumerate(values):
                 self.input_table.setItem(row, column, Q.QTableWidgetItem(str(value)))
         self.project_status.setStyleSheet("color:#79c7ff")
@@ -407,39 +510,103 @@ class StudioWindow:
         try:
             self.driver = GncZihinDriver(self.motor_path.text().strip())
             inventory = self.driver.inventory()
+            self._last_inventory = inventory
+            projects = self.store.projects()
+            default_project = self.worker_project.currentData()
             self.worker_table.setRowCount(len(inventory))
-            ready_count = 0
             for row, item in enumerate(inventory):
                 target = item["target_id"]
                 enabled = self.QtWidgets.QTableWidgetItem()
                 enabled.setFlags(enabled.flags() | QtCore.Qt.ItemIsUserCheckable)
-                ready = [strategy for strategy in item["strategies"]
-                         if (strategy.get("status") or {}).get("type") == 2]
-                enabled.setCheckState(QtCore.Qt.Checked if len(ready) == 1 else QtCore.Qt.Unchecked)
+                enabled.setCheckState(QtCore.Qt.Unchecked)
                 self.worker_table.setItem(row, 0, enabled)
-                strategy_id = ready[0].get("id", "") if len(ready) == 1 else ""
-                status = "hazır" if strategy_id else (item["error"] or "hazır strategy seçin")
-                if strategy_id: ready_count += 1
-                for column, value in enumerate((row + 1, target, strategy_id, status, 0), start=1):
-                    self.worker_table.setItem(row, column, self.QtWidgets.QTableWidgetItem(str(value)))
+                self.worker_table.setItem(row, 1, self.QtWidgets.QTableWidgetItem(str(row + 1)))
+                self.worker_table.setItem(row, 2, self.QtWidgets.QTableWidgetItem(str(target)))
+                project_combo = self.QtWidgets.QComboBox()
+                for project in projects: project_combo.addItem(project["name"], project["id"])
+                index = project_combo.findData(default_project)
+                if index >= 0: project_combo.setCurrentIndex(index)
+                project_combo.currentIndexChanged.connect(lambda _index, r=row: self.refresh_worker_match(r))
+                self.worker_table.setCellWidget(row, 3, project_combo)
+                for column in (4, 5, 6): self.worker_table.setItem(row, column, self.QtWidgets.QTableWidgetItem("0" if column == 6 else ""))
+                self.refresh_worker_match(row)
+            ready_count = sum(self.worker_table.item(row, 0).checkState() == QtCore.Qt.Checked
+                              for row in range(self.worker_table.rowCount()))
             color = "#64d6a1" if ready_count >= 2 else "#f1bc60"
             self.worker_status.setStyleSheet(f"color:{color}")
             self.worker_status.setText(f"{len(inventory)} target · {ready_count} hazır worker adayı")
         except Exception as exc:
             self.worker_status.setStyleSheet("color:#ff8e8e"); self.worker_status.setText(str(exc))
 
+    def refresh_worker_match(self, row):
+        project_combo = self.worker_table.cellWidget(row, 3)
+        project_id = project_combo.currentData() if project_combo else None
+        project = self.store.project(project_id) if project_id is not None else None
+        item = self._last_inventory[row]
+        candidate = None; identity_ok = False
+        if project:
+            expected_inputs = parse_strategy_inputs(project["pine_source"])
+            expected_title = strategy_title(project["pine_source"])
+            identity = (self.store.settings(project_id) or {}).get("tradingview_identity", {})
+            ready = [strategy for strategy in item["strategies"] if (strategy.get("status") or {}).get("type") == 2]
+            matched = [strategy for strategy in ready
+                       if strategy_structure_matches(strategy, expected_title, len(expected_inputs))]
+            candidate = matched[0] if len(matched) == 1 else None
+            identity_ok = bool(
+                candidate
+                and identity.get("pine_id")
+                and candidate.get("pine_id") == identity.get("pine_id")
+                and identity.get("pine_hash") == project.get("pine_hash")
+            )
+        enabled = self.worker_table.item(row, 0)
+        enabled.setCheckState(QtCore.Qt.Checked if identity_ok else QtCore.Qt.Unchecked)
+        strategy_cell = self.worker_table.item(row, 4)
+        strategy_cell.setText(str(candidate.get("id", "") if candidate else ""))
+        strategy_cell.setData(QtCore.Qt.UserRole, candidate)
+        self.worker_table.item(row, 5).setText(
+            "kimlik + yapı doğrulandı" if identity_ok else
+            "yapısal eşleşme · ilk kaynak onayı gerekli" if candidate else
+            (item["error"] or "proje adı/input yapısı eşleşmedi")
+        )
+
+    def bind_selected_strategy(self):
+        try:
+            row = self.worker_table.currentRow()
+            project_widget = self.worker_table.cellWidget(row, 3) if row >= 0 else None
+            project_id = project_widget.currentData() if project_widget else None
+            if row < 0 or project_id is None:
+                raise ValueError("Önce proje ve yapısal eşleşen worker satırını seçin.")
+            strategy = self.worker_table.item(row, 4).data(QtCore.Qt.UserRole)
+            if not strategy or not strategy.get("pine_id"):
+                raise ValueError("Bu satırda bağlanabilir Pine kimliği yok.")
+            answer = self.QtWidgets.QMessageBox.question(
+                self.window, "Pine kaynağını doğrula",
+                "Grafikteki stratejinin yapıştırdığınız Pine kaynağı olduğunu onaylıyor musunuz?"
+            )
+            if answer != self.QtWidgets.QMessageBox.Yes:
+                return
+            self.store.save_settings(project_id, {"tradingview_identity": {
+                "pine_id": strategy["pine_id"], "name": strategy.get("name"),
+                "input_ids": strategy.get("input_ids", []),
+                "pine_hash": self.store.project(project_id)["pine_hash"],
+            }})
+            self.discover_targets()
+        except ValueError as exc:
+            self.worker_status.setStyleSheet("color:#ff8e8e"); self.worker_status.setText(str(exc))
+
     def start_workers(self):
         try:
-            project_id = self.worker_project.currentData()
-            if project_id is None: raise ValueError("Worker için proje seçilmedi.")
             if self.driver is None: raise ValueError("Önce targetları bulun.")
             assignments = []
             for row in range(self.worker_table.rowCount()):
                 if self.worker_table.item(row, 0).checkState() == QtCore.Qt.Checked:
+                    if self.worker_table.item(row, 5).text() != "kimlik + yapı doğrulandı":
+                        raise ValueError("Seçili workerın Pine kimliği ve input yapısı doğrulanmadı.")
+                    project_id = self.worker_table.cellWidget(row, 3).currentData()
                     assignments.append(WorkerAssignment(
                         int(self.worker_table.item(row, 1).text()),
                         self.worker_table.item(row, 2).text(), (project_id,),
-                        self.worker_table.item(row, 3).text().strip() or None,
+                        self.worker_table.item(row, 4).text().strip() or None,
                     ))
             if not assignments: raise ValueError("En az bir worker seçin.")
             self.supervisor = WorkerSupervisor(self.store, self.driver)
@@ -456,12 +623,18 @@ class StudioWindow:
 
     def refresh_worker_states(self):
         if not self.supervisor: return
+        for worker_id in self.supervisor.restart_failed():
+            state = self.supervisor.states[worker_id]
+            marker = (worker_id, state.restarts)
+            if marker not in self._notified_worker_restarts:
+                self._notified_worker_restarts.add(marker)
+                self.notify("Worker yeniden başlatıldı", f"Worker {worker_id} yeniden başlatma {state.restarts}/3")
         for row in range(self.worker_table.rowCount()):
             worker_id = int(self.worker_table.item(row, 1).text())
             state = self.supervisor.states.get(worker_id)
             if state:
-                self.worker_table.item(row, 4).setText(state.status)
-                self.worker_table.item(row, 5).setText(str(state.completed))
+                self.worker_table.item(row, 5).setText(state.status)
+                self.worker_table.item(row, 6).setText(str(state.completed))
                 if state.status == "failed" and worker_id not in self._notified_worker_errors:
                     self._notified_worker_errors.add(worker_id)
                     self.notify("Worker müdahalesi gerekiyor", f"Worker {worker_id}: {state.error or 'bilinmeyen hata'}")
@@ -490,6 +663,36 @@ class StudioWindow:
             self.symbols.setText(", ".join(profile))
             self.preview_plan()
 
+    def apply_cost_template(self, name):
+        template = self.cost_templates.get(name)
+        if not template:
+            return
+        self.initial_capital.setValue(float(template["initial_capital"]))
+        self.position_size.setValue(float(template["position_size"]))
+        self.commission.setValue(float(template["commission_value"]))
+        self.spread.setValue(float(template["spread"]))
+        self.slippage.setValue(int(template["slippage"]))
+        self.risk_mode.setCurrentText(str(template["risk_mode"]))
+        self.risk_value.setValue(float(template["risk_value"]))
+        self.preview_plan()
+
+    def save_cost_template(self):
+        name, accepted = self.QtWidgets.QInputDialog.getText(self.window, "Maliyet şablonu", "Şablon adı:")
+        name = name.strip()
+        if not accepted or not name:
+            return
+        self.cost_templates[name] = {
+            "initial_capital": self.initial_capital.value(), "position_size": self.position_size.value(),
+            "commission_value": self.commission.value(), "spread": self.spread.value(),
+            "slippage": self.slippage.value(), "risk_mode": self.risk_mode.currentText(),
+            "risk_value": self.risk_value.value(),
+        }
+        self.store.save_app_settings({"cost_templates": self.cost_templates})
+        if self.cost_scenario.findText(name) < 0:
+            self.cost_scenario.addItem(name)
+        self.cost_scenario.setCurrentText(name)
+        self.plan_status.setText(f"Maliyet şablonu kaydedildi: {name}")
+
     def _current_plan(self):
         values = {}
         for row in range(self.plan_inputs.rowCount()):
@@ -503,7 +706,7 @@ class StudioWindow:
         date_range = {}
         if self.date_from.text().strip(): date_range["from"] = self.date_from.text().strip()
         if self.date_to.text().strip(): date_range["to"] = self.date_to.text().strip()
-        multiplier = COST_SCENARIOS[self.cost_scenario.currentText()]
+        multiplier = COST_SCENARIOS.get(self.cost_scenario.currentText(), 1.0)
         scenario_costs = apply_cost_multiplier(
             self.commission.value(), self.spread.value(), self.slippage.value(), multiplier
         )
@@ -512,14 +715,21 @@ class StudioWindow:
                        "risk_mode": self.risk_mode.currentText(), "risk_value": self.risk_value.value(),
                        "scenario": self.cost_scenario.currentText(), **scenario_costs}
         tradingview_inputs = {}
-        mappings = ((self.capital_input_id.text().strip(), assumptions["initial_capital"]),
-                    (self.commission_input_id.text().strip(), assumptions["commission_value"]),
-                    (self.slippage_input_id.text().strip(), assumptions["slippage"]))
-        for input_id, value in mappings:
+        input_mapping = {}
+        mappings = {
+            "initial_capital": (self.capital_input_id.text().strip(), assumptions["initial_capital"]),
+            "position_size": (self.position_input_id.text().strip(), assumptions["position_size"]),
+            "commission_value": (self.commission_input_id.text().strip(), assumptions["commission_value"]),
+            "spread": (self.spread_input_id.text().strip(), assumptions["spread"]),
+            "slippage": (self.slippage_input_id.text().strip(), assumptions["slippage"]),
+            "risk_value": (self.risk_input_id.text().strip(), assumptions["risk_value"]),
+        }
+        for name, (input_id, value) in mappings.items():
             if input_id:
                 if not input_id.startswith("in_") or not input_id[3:].isdigit():
                     raise ValueError(f"Geçersiz maliyet input ID: {input_id}")
                 tradingview_inputs[input_id] = value
+                input_mapping[name] = input_id
         return ScanPlan(
             study_id=self.study_id.text().strip(), symbols=split(self.symbols.text()),
             timeframes=split(self.timeframes.text()), input_values=values, date_range=date_range,
@@ -528,7 +738,10 @@ class StudioWindow:
                       "min_net_profit": self.min_net.value(),
                       "max_daily_loss_pct": self.max_daily_loss.value(),
                       "max_total_loss_pct": self.max_total_loss.value()},
-            costs={"assumptions": assumptions, "tradingview_inputs": tradingview_inputs},
+            costs={"assumptions": assumptions, "tradingview_inputs": tradingview_inputs,
+                   "input_mapping": input_mapping},
+            timeout=self.default_timeout.value(), poll_interval=self.default_poll.value(),
+            stable_reads=self.default_stable.value(),
         )
 
     def preview_plan(self, *_args):
@@ -536,8 +749,10 @@ class StudioWindow:
             count = self._current_plan().task_count
             disk_mb = count * 2.5 / 1024
             warning = " · geniş arama/curve-fitting riski" if count > 10_000 else ""
+            observed = self.store.observed_seconds_per_test(self.plan_project.currentData())
+            duration = f" · tahmini {self._format_duration(count * observed)}" if observed else " · süre için geçmiş veri yok"
             self.plan_status.setStyleSheet("color:#79c7ff")
-            self.plan_status.setText(f"{count:,} görev · tahmini {disk_mb:.1f} MB{warning}")
+            self.plan_status.setText(f"{count:,} görev · tahmini {disk_mb:.1f} MB{duration}{warning}")
         except (ValueError, json.JSONDecodeError) as exc:
             self.plan_status.setStyleSheet("color:#ff8e8e"); self.plan_status.setText(str(exc))
 
@@ -593,6 +808,50 @@ class StudioWindow:
         close = self.QtWidgets.QPushButton("Kapat"); close.clicked.connect(dialog.accept); layout.addWidget(close)
         dialog.exec()
 
+    def show_result_details(self, index):
+        row = self._result_rows[index.row()]
+        metrics = row["metrics"]
+        dialog = self.QtWidgets.QDialog(self.window)
+        dialog.setWindowTitle(f"Preset detayı · {row['task_key'][:12]}"); dialog.resize(980, 720)
+        layout = self.QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(CurveChart(metrics.get("equity_curve", []), dialog))
+        splitter = self.QtWidgets.QSplitter()
+        detail = self.QtWidgets.QTableWidget(0, 2)
+        detail.setHorizontalHeaderLabels(["Ölçüm", "Değer"]); detail.horizontalHeader().setStretchLastSection(True)
+        scalar = [(key, value) for key, value in metrics.items() if key not in {"equity_curve", "daily_pnl"}]
+        detail.setRowCount(len(scalar))
+        for line, (key, value) in enumerate(sorted(scalar)):
+            detail.setItem(line, 0, self.QtWidgets.QTableWidgetItem(key))
+            rendered = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+            detail.setItem(line, 1, self.QtWidgets.QTableWidgetItem(rendered))
+        calendar = self.QtWidgets.QTableWidget(0, 2); calendar.setHorizontalHeaderLabels(["Gün", "P/L"])
+        daily = metrics.get("daily_pnl", {}); calendar.setRowCount(len(daily))
+        for line, (day, pnl) in enumerate(sorted(daily.items())):
+            calendar.setItem(line, 0, self.QtWidgets.QTableWidgetItem(day))
+            cell = self.QtWidgets.QTableWidgetItem(f"{pnl:,.2f}")
+            cell.setForeground(QtGui.QColor("#64d6a1" if pnl >= 0 else "#ff8e8e")); calendar.setItem(line, 1, cell)
+        splitter.addWidget(detail); splitter.addWidget(calendar); layout.addWidget(splitter, 1)
+        close = self.QtWidgets.QPushButton("Kapat"); close.clicked.connect(dialog.accept); layout.addWidget(close)
+        dialog.exec()
+
+    def validate_selected_results(self):
+        selected = sorted({index.row() for index in self.results_table.selectionModel().selectedRows()})
+        if not selected:
+            self.QtWidgets.QMessageBox.information(self.window, "Aşamalı doğrulama", "En az bir sonuç seçin.")
+            return
+        symbol, accepted = self.QtWidgets.QInputDialog.getText(
+            self.window, "Alternatif sağlayıcı", "Alternatif TradingView sembolü (örn. FX:EURUSD):"
+        )
+        if not accepted:
+            return
+        inserted = 0
+        for index in selected:
+            row = self._result_rows[index]
+            if row["verified"] and row["classification"] != "elenmiş":
+                inserted += enqueue_followups(self.store, row["task_id"], row["payload"], symbol)
+        self.refresh_dashboard()
+        self.dashboard_status.setText(f"{inserted} doğrulama görevi kuyruğa eklendi.")
+
     def export_current_results(self):
         project_id = self.result_project.currentData()
         if project_id is None: return
@@ -600,6 +859,18 @@ class StudioWindow:
         rows = self.store.results(project_id, None if classification == "Tümü" else classification)
         path, _ = self.QtWidgets.QFileDialog.getSaveFileName(self.window, "CSV dışa aktar", "tv-scan-results.csv", "CSV (*.csv)")
         if path: export_results_csv(rows, path)
+
+    def export_current_report(self):
+        project_id = self.result_project.currentData()
+        if project_id is None:
+            return
+        project = self.store.project(project_id)
+        project["settings"] = self.store.settings(project_id) or {}
+        path, _ = self.QtWidgets.QFileDialog.getSaveFileName(
+            self.window, "PDF raporu", f"{project['name']}-tv-scan-report.pdf", "PDF (*.pdf)"
+        )
+        if path:
+            export_project_pdf(project, self.store.results(project_id), path)
 
     def refresh_dashboard(self):
         Q = self.QtWidgets
@@ -630,7 +901,9 @@ class StudioWindow:
         self._last_dashboard_counts = {**counts, "candidates": current_candidates}
         self.project_table.setRowCount(len(projects))
         for row, project in enumerate(projects):
-            values = (project["id"], project["name"], project["status"], project["priority"], project["task_count"])
+            progress = (project["done_count"] / project["task_count"] * 100) if project["task_count"] else 0
+            values = (project["id"], project["name"], project["status"], project["priority"],
+                      project["task_count"], f"%{progress:.1f} · hata {project['issue_count']}")
             for column, value in enumerate(values):
                 self.project_table.setItem(row, column, Q.QTableWidgetItem(str(value)))
 
@@ -710,11 +983,21 @@ class StudioWindow:
             self.resource_status.setText(str(exc))
 
     def notify(self, title, message):
-        if self.tray.isVisible():
+        if self.notifications_enabled.isChecked() and self.tray.isVisible():
             self.tray.showMessage(title, message, self.QtWidgets.QSystemTrayIcon.Information, 6000)
 
 
 def main() -> int:
+    if "--self-test" in sys.argv:
+        store = Store(data_path())
+        destination = store.path.parent / "portable-self-test.pdf"
+        export_project_pdf(
+            {"name": "Taşınabilir Türkçe Test", "pine_hash": "self-test", "settings": {}},
+            [], destination,
+        )
+        if not store.path.is_file() or not destination.read_bytes().startswith(b"%PDF"):
+            return 2
+        return 0
     application = QtWidgets.QApplication(sys.argv)
     application.setStyleSheet(STYLE)
     studio = StudioWindow(Store(data_path()))

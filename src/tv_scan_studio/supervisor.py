@@ -28,6 +28,7 @@ class WorkerState:
     completed: int = 0
     last_seen: float = field(default_factory=time.time)
     error: str | None = None
+    restarts: int = 0
 
 
 class WorkerSupervisor:
@@ -37,6 +38,8 @@ class WorkerSupervisor:
         self.heartbeat_seconds = heartbeat_seconds
         self.states: dict[int, WorkerState] = {}
         self._threads: list[threading.Thread] = []
+        self._threads_by_worker: dict[int, threading.Thread] = {}
+        self._assignments: dict[int, tuple[WorkerAssignment, bool]] = {}
         self._stop = threading.Event()
         self._lock = threading.Lock()
 
@@ -55,14 +58,40 @@ class WorkerSupervisor:
         missing = [item.target_id for item in assignments if item.target_id not in available]
         if missing:
             raise ValueError("TradingView target bulunamadı: " + ", ".join(missing))
-        self._stop.clear(); self._threads = []; self.states = {}
+        self._stop.clear(); self._threads = []; self._threads_by_worker = {}; self._assignments = {}; self.states = {}
         for assignment in assignments:
             self.states[assignment.worker_id] = WorkerState(assignment.worker_id, assignment.target_id)
-            thread = threading.Thread(
-                target=self._loop, args=(assignment, stop_when_idle),
-                name=f"tv-scan-worker-{assignment.worker_id}", daemon=True,
-            )
-            self._threads.append(thread); thread.start()
+            self._assignments[assignment.worker_id] = (assignment, stop_when_idle)
+            self._start_thread(assignment, stop_when_idle)
+
+    def _start_thread(self, assignment: WorkerAssignment, stop_when_idle: bool) -> None:
+        thread = threading.Thread(
+            target=self._loop, args=(assignment, stop_when_idle),
+            name=f"tv-scan-worker-{assignment.worker_id}", daemon=True,
+        )
+        self._threads.append(thread)
+        self._threads_by_worker[assignment.worker_id] = thread
+        thread.start()
+
+    def restart_failed(self, max_restarts: int = 3) -> list[int]:
+        """Restart terminal worker threads without duplicating a live target."""
+        restarted: list[int] = []
+        if self._stop.is_set():
+            return restarted
+        with self._lock:
+            for worker_id, state in self.states.items():
+                thread = self._threads_by_worker.get(worker_id)
+                if state.status != "failed" or (thread and thread.is_alive()) or state.restarts >= max_restarts:
+                    continue
+                assignment, stop_when_idle = self._assignments[worker_id]
+                state.restarts += 1
+                state.status = "restarting"
+                state.error = None
+                state.last_seen = time.time()
+                self.store.log_event("warning", f"Worker yeniden başlatılıyor ({state.restarts}/{max_restarts})", worker_id=worker_id)
+                self._start_thread(assignment, stop_when_idle)
+                restarted.append(worker_id)
+        return restarted
 
     def _loop(self, assignment: WorkerAssignment, stop_when_idle: bool) -> None:
         worker = ScanWorker(

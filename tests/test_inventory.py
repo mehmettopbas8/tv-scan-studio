@@ -1,4 +1,4 @@
-from tv_scan_studio.tradingview import GncZihinDriver
+from tv_scan_studio.tradingview import GncZihinDriver, strategy_structure_matches
 
 
 def test_inventory_keeps_failed_targets(monkeypatch):
@@ -29,3 +29,10 @@ def test_snapshot_excludes_internal_pine_payload(monkeypatch):
     })
     snapshot = driver.snapshot("target", "study")
     assert snapshot.inputs == {"in_0": 20, "in_12": True}
+
+
+def test_strategy_structure_requires_title_and_exact_input_ids():
+    strategy = {"name": "My Strategy", "input_ids": ["in_0", "in_1"]}
+    assert strategy_structure_matches(strategy, "My Strategy", 2)
+    assert not strategy_structure_matches(strategy, "Other", 2)
+    assert not strategy_structure_matches(strategy, "My Strategy", 3)

@@ -7,6 +7,7 @@ from typing import Any
 
 from .storage import Store
 from .tradingview import TradingViewDriver, VerificationMismatch, wait_for_verified_result
+from .analytics import analyze_trades
 
 
 @dataclass(slots=True)
@@ -43,12 +44,17 @@ class ScanWorker:
                 poll_interval=float(payload.get("poll_interval", 0.7)),
                 stable_reads=int(payload.get("stable_reads", 3)),
             )
+            metrics = dict(result.metrics or {})
+            analysis = analyze_trades(
+                result.trades, float(payload.get("costs", {}).get("assumptions", {}).get("initial_capital", 0))
+            )
+            metrics.update(analysis)
             classification = classify(
-                result.metrics or {}, payload.get("criteria", {}),
+                metrics, payload.get("criteria", {}),
                 payload.get("validation", {}),
             )
             self.store.complete(
-                task.id, self.worker_id, result.metrics or {}, classification, verified=True,
+                task.id, self.worker_id, metrics, classification, verified=True,
                 evidence={
                     "symbol": result.symbol, "timeframe": result.timeframe,
                     "inputs": result.inputs, "period": result.period,

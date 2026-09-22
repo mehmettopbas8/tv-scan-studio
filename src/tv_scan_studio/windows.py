@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from typing import Callable
 
@@ -45,6 +46,34 @@ def cdp_healthy(port: int = 9222, timeout: float = 2) -> bool:
         return bool(data.get("webSocketDebuggerUrl"))
     except (OSError, ValueError, json.JSONDecodeError):
         return False
+
+
+def open_chart_tabs(count: int, *, port: int = 9222, timeout: float = 5,
+                    urlopen: Callable[..., object] = urllib.request.urlopen) -> list[str]:
+    """Duplicate a chart as tabs inside the one existing CDP browser profile."""
+    if count < 1 or count > 16:
+        raise ValueError("Yeni tab sayısı 1 ile 16 arasında olmalıdır.")
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/json/list", timeout=timeout) as response:
+            targets = json.loads(response.read())
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"CDP {port} target listesi okunamadı.") from exc
+    charts = [item.get("url") for item in targets
+              if item.get("type") == "page" and "tradingview.com/chart" in item.get("url", "")]
+    if not charts:
+        raise RuntimeError("Kopyalanacak TradingView chart tabı bulunamadı.")
+    created = []
+    for _ in range(count):
+        endpoint = f"http://127.0.0.1:{port}/json/new?{urllib.parse.quote(charts[0], safe=':/?=&%')}"
+        request = urllib.request.Request(endpoint, method="PUT")
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                target = json.loads(response.read())
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Aynı CDP oturumunda yeni chart tabı açılamadı.") from exc
+        if target.get("id"):
+            created.append(str(target["id"]))
+    return created
 
 
 def tradingview_running(

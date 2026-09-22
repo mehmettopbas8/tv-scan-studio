@@ -101,3 +101,22 @@ def test_bulk_retry_returns_recoverable_project_tasks_to_queue(tmp_path):
     assert store.retry_tasks(project) == 1
     assert store.counts(project) == {"pending": 1}
     assert store.project(project)["status"] == "queued"
+
+
+def test_project_settings_merge_preserves_verified_identity(tmp_path):
+    store = Store(tmp_path / "studio.db")
+    project = store.create_project("Identity", 'strategy("Identity")')
+    store.save_settings(project, {"tradingview_identity": {"pine_id": "USER;abc"}})
+    store.save_settings(project, {"study_id": "sid", "symbols": ["OANDA:EURUSD"]})
+    assert store.settings(project)["tradingview_identity"]["pine_id"] == "USER;abc"
+    assert store.settings(project)["study_id"] == "sid"
+
+
+def test_paused_project_is_not_claimed(tmp_path):
+    store = Store(tmp_path / "studio.db")
+    project = store.create_project("Paused", 'strategy("Paused")')
+    store.enqueue(project, "one", {})
+    store.update_project(project, status="paused")
+    assert store.claim_next(1, [project]) is None
+    store.update_project(project, status="queued")
+    assert store.claim_next(1, [project]) is not None

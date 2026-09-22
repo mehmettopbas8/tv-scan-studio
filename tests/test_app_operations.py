@@ -25,7 +25,7 @@ def test_app_builds_operational_controls_and_cost_mapping(tmp_path):
     studio.commission_input_id.setText("in_7")
     studio.commission.setValue(0.125)
     assert studio._current_plan().costs["tradingview_inputs"] == {"in_7": 0.125}
-    assert studio.pages.count() == 5
+    assert studio.pages.count() == 6
     studio.worker_timer.stop()
     studio.window.close()
     del application
