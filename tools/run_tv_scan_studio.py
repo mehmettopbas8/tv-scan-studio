@@ -1,3 +1,5 @@
+"""Source and PyInstaller entry point; run from the repository root after install."""
+
 from tv_scan_studio.app import main
 
 

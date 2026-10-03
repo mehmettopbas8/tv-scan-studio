@@ -2,6 +2,7 @@
 
 ## 0.2.0 — release candidate, not yet published
 
+- Move the packaging launcher under tools/ and add step-by-step EXE download, verification, first-run, update and removal instructions, including the development Actions artifact path before a Release exists.
 - Package Windows builds as a single self-contained EXE; publish direct EXE/checksum and an optional one-EXE ZIP, without an adjacent `_internal` folder. Runtime extraction uses the Windows temporary directory; persistent user data stays in AppData.
 - Added multi-project worker assignment on chart tabs sharing the single CDP 9222 session.
 - Added persistent Pine identity and source-hash binding, including guarded temporary opening/restoration of a closed worker Pine panel. Existing editors are preserved; unavailable source still requires explicit user confirmation and is not automatic equality evidence.

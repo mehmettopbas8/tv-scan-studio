@@ -29,28 +29,61 @@ Projeler, görev kuyruğu, sonuçlar ve doğrulama kayıtları SQLite'ta tutulur
 - Tarihli Deep Backtesting görevleri için TradingView hesabının ilgili özelliğe erişimi ve yeterli veri kapsamı gerekir.
 - Kaynaktan çalıştırmak için Python **3.11–3.13**; aşağıdaki örnek Python 3.12 kullanır. Python 3.14 proje bağımlılık aralığında değildir.
 
-### Son kullanıcı: portable paket
+### Son kullanıcı: EXE indirme ve çalıştırma
 
-Yayımlanan paketler için [GitHub Releases](https://github.com/mehmettopbas8/tv-scan-studio/releases) sayfasını kullanın. Henüz bir sürüm yayımlanmamışsa aşağıdaki kaynak kurulumu veya yerel paket oluşturma yolunu izleyin; geliştirme çıktısını yayımlanmış sürüm sanmayın.
+Kurulum sihirbazı yoktur: **indir → doğrula → EXE'ye çift tıkla**. Python, Git, pip veya kaynak kod indirmeniz gerekmez. `Code → Download ZIP` uygulama değil, kaynak kod indirir; EXE edinmek için aşağıdaki yolları kullanın.
 
-1. Tek dosyalı `TV-Scan-Studio-0.2.0.exe` ve ona ait `.exe.sha256` dosyasını aynı güvenilir sürüm kaynağından edinin.
-2. EXE'nin SHA-256 değerini doğrulayın; uyuşmuyorsa çalıştırmayın.
-3. EXE'yi istediğiniz klasöre koyup açın. ZIP seçeneğini indirdiyseniz içindeki tek EXE'yi çıkarın.
+#### 1. EXE'yi edinme
+
+**Yayımlanmış sürüm varsa — önerilen yol:**
+
+1. [GitHub Releases](https://github.com/mehmettopbas8/tv-scan-studio/releases) sayfasını açın ve istediğiniz sürüme girin. Ön sürüm / release candidate etiketi varsa bunu kararlı sürümle karıştırmayın.
+2. Sürümün `Assets` bölümünde `TV-Scan-Studio-0.2.0.exe` ve `TV-Scan-Studio-0.2.0.exe.sha256` dosyalarına tıklayıp ikisini de indirin. Sürüm numarası farklı olabilir; EXE ve checksum aynı sürüme ait olmalı.
+3. ZIP'i tercih ederseniz `TV-Scan-Studio-0.2.0-portable.zip` ve onun `.zip.sha256` dosyasını indirin. Önce ZIP'i aşağıdaki yöntemle doğrulayın, sonra Windows'ta sağ tık → `Tümünü ayıkla` ile içindeki tek EXE'yi çıkarın. ZIP'in içinden doğrudan çalıştırmayın.
+
+**Henüz Release yoksa — mevcut geliştirme paketi:**
+
+1. GitHub hesabınızla giriş yapıp [Actions](https://github.com/mehmettopbas8/tv-scan-studio/actions/workflows/windows-build.yml) sayfasını açın.
+2. `Windows test and portable build` iş akışında istediğiniz commit'e ait, yeşil işaretli **tamamlanmış** çalışmayı seçin. Başarısız veya devam eden işi kullanmayın.
+3. Çalışmanın özetindeki `Artifacts` bölümünden `TV-Scan-Studio-windows-x64` paketini indirin. GitHub artefakt indirmesi oturum açmayı gerektirebilir; artefaktlar saklama süresi dolunca silinebilir.
+4. İndirilen artefakt ZIP'ine sağ tıklayıp `Tümünü ayıkla` seçin. Çıkan dosyalar arasından sürüm numaralı `.exe` ve ona ait `.exe.sha256` dosyasını kullanın. Yanındaki `portable.zip` alternatif dağıtım kopyasıdır; iki ayrı uygulama kurmanız gerekmez.
+5. Bu paket bir **CI geliştirme çıktısıdır**, yayımlanmış kararlı sürüm değildir. Otomatik testlerin geçmesi bütün canlı kullanıcı kabulünün tamamlandığı anlamına gelmez.
+
+3 Ekim 2026 itibarıyla Release henüz yayımlanmamıştır; yukarıdaki Actions yolu kullanılabilir. Bir EXE size doğrudan verildiyse de aşağıdaki doğrulama ve ilk açılış adımlarını izleyin.
+
+#### 2. Dosyayı doğrulama
+
+EXE ve ona ait checksum'u aynı klasöre koyun. Dosya Gezgini'nde bu klasörü açın, adres çubuğuna `powershell` yazıp Enter'a basın. Aşağıdaki komutta dosya adını indirdiğiniz sürüme göre değiştirin:
+
+```powershell
+$fileToCheck = ".\TV-Scan-Studio-0.2.0.exe"
+$expected = (Get-Content "$fileToCheck.sha256").Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
+$actual = (Get-FileHash -LiteralPath $fileToCheck -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw "SHA-256 eşleşmiyor. Dosyayı çalıştırmayın." }
+Write-Host "SHA-256 doğrulandı."
+```
+
+ZIP doğrularken yalnız ilk satırı `$fileToCheck = ".\TV-Scan-Studio-0.2.0-portable.zip"` olarak değiştirin; yanında aynı adlı `.zip.sha256` bulunmalı. Checksum dosyası çalışma bağımlılığı değildir, dosya bütünlüğü kontrolü içindir. Checksum'u da aynı güvenilir kaynaktan indirin; hash eşleşmesi yayıncı kimliği veya zararlı yazılım taraması yerine geçmez.
+
+#### 3. İlk açılış
+
+1. Doğruladığınız EXE'yi kalıcı bir klasöre koyun; örneğin kullanıcı klasörünüzde `Uygulamalar\TV Scan Studio`. İsterseniz yalnız bu EXE'yi masaüstüne koyabilirsiniz.
+2. EXE'ye çift tıklayın. Normal kullanıcı olarak çalıştırın; yönetici yetkisi gerekmez. İlk açılışta bağımlılıklar çıkarıldığı için birkaç saniye bekleyin, art arda başka kopya başlatmayın.
+3. İmzasız paket Windows SmartScreen uyarısı verebilir. Kaynağı ve checksum'u kontrol etmeden uyarıyı geçmeyin. Antivirüsü kapatmayın veya karantina engelini otomatik aşmayın; şüpheli indirmede durun.
+4. Ana ekran açılınca kurulum tamamdır. Tarama kendiliğinden başlamaz. TradingView'i bağlamak ve ilk projeyi oluşturmak için aşağıdaki `TradingView bağlantısı` ve `İlk tarama` bölümlerini izleyin.
+5. Kısayol isterseniz EXE'ye sağ tıklayın; Windows sürümüne göre `Daha fazla seçenek göster → Gönder → Masaüstü (kısayol oluştur)` yolunu kullanın. EXE'nin bulunduğu asıl dosyayı sonradan taşımayın; kısayol eski konumu işaret eder.
 
 **Yalnız EXE yeterlidir:** Python kurulumu, yan DLL veya `_internal` klasörü taşımanız gerekmez. Checksum dosyası doğrulama içindir, çalıştırma bağımlılığı değildir. Bağımlılıklar EXE'nin içine gömülür; açılışta Windows geçici dizinine çıkarılır ve normal kapanışta temizlenir. Bu nedenle ilk açılış klasörlü paketten yavaş olabilir; geçici dizinin yazılabilir olması gerekir. Yönetici olarak çalıştırmayın. Bu, diske hiç dosya yazılmadığı anlamına gelmez: kalıcı kullanıcı verileri aşağıdaki AppData dizininde tutulur.
 
 Bu çalışma biçimi [PyInstaller tek dosya paketleme açıklamasına](https://pyinstaller.org/en/stable/operating-mode.html#how-the-one-file-program-works) dayanır. Zorla kapatma/çökme durumunda geçici çıkarma klasörü kalabilir; uygulama veritabanı bu geçici klasöre yazılmaz.
 
-Örnek EXE checksum kontrolü; dosya adını indirdiğiniz sürüme göre değiştirin:
+#### 4. Yeni sürüme geçme ve kaldırma
 
-```powershell
-$executable = ".\TV-Scan-Studio-0.2.0.exe"
-$expected = (Get-Content "$executable.sha256").Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
-$actual = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
-if ($actual -ne $expected) { throw "EXE SHA-256 değeri eşleşmiyor." }
-```
+Otomatik güncelleme yoktur. Yeni EXE'yi ve eşleşen checksum'u indirin; çalışan taramayı kontrollü durdurun, uygulamada `Yedek oluştur` ile verileri yedekleyip uygulamayı kapatın. Yeni EXE'yi doğruladıktan sonra eski dosyanın yerine koyun veya ayrı konumdan açın. Aynı Windows kullanıcısında uygulama verileri `%LOCALAPPDATA%\TVScanStudio\studio.db` içinde kalır; yedek olmadan eski sürüme dönüşü güvenli varsaymayın.
 
-İlk dağıtım imzasızdır; Windows SmartScreen uyarısı görülebilir. Kaynağı ve checksum'u doğrulamadan güvenlik uyarısını geçmeyin. Checksum dosya bütünlüğünü gösterir, yayıncının kimliğini tek başına kanıtlamaz.
+Başka bilgisayara **EXE'yi taşımak projeleri taşımaz**. Verileri ayrıca yedekleyin; `Yedeği yeni dosyaya aç` eyleminin aktif veritabanına otomatik geçmediğini aşağıdaki yedekleme bölümünde okuyun.
+
+Kaldırmak için uygulamayı kapatıp EXE ve varsa kısayolunu silmeniz yeterlidir. Bu işlem kullanıcı veritabanını silmez. Verileri de kaldırmak istiyorsanız önce yedek alın; AppData klasörünü ayrı ve bilinçli olarak temizleyin.
 
 ### Geliştirici: kaynaktan çalıştırma
 
@@ -69,7 +102,7 @@ Depo zaten bilgisayarınızdaysa `git clone` yerine mevcut `tv-scan-studio` klas
 Alternatif uygulama giriş noktası:
 
 ```powershell
-.\.venv\Scripts\python.exe run_tv_scan_studio.py
+.\.venv\Scripts\python.exe tools\run_tv_scan_studio.py
 ```
 
 Uygulama tek masaüstü örneğiyle çalışır. İkinci başlatma, mevcut taramayı korumak için ikinci pencere açmaz.
@@ -160,7 +193,6 @@ tv-scan-studio/
 ├── CHANGELOG.md                    Sürüm değişiklikleri
 ├── LICENSE                         AGPL-3.0-only lisansı
 ├── pyproject.toml                  Bağımlılıklar, Python aralığı, giriş noktası
-├── run_tv_scan_studio.py            Kaynak / paket uygulama başlatıcısı
 ├── TVScanStudio.spec                PyInstaller Windows paket tanımı
 ├── .github/workflows/
 │   └── windows-build.yml            Windows test, paket ve etiketli yayın hattı
@@ -188,6 +220,7 @@ tv-scan-studio/
 │   └── backup.py                   Yedek, checksum ve güvenli geri yükleme
 ├── tests/                          Birim ve entegrasyon testleri
 └── tools/                          Paketleme ve geliştirici yardımcıları
+    ├── run_tv_scan_studio.py        Kaynak / EXE paketleme başlatıcısı
     ├── build_release.py            Portable ZIP ve SHA-256 üretimi
     ├── live_two_worker_smoke.py     İzinli gerçek iki-worker kontrolü
     ├── render_ui_preview.py        Geliştirici arayüz önizlemesi

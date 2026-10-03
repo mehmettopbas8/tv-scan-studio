@@ -49,3 +49,14 @@ def test_packaging_spec_embeds_binaries_without_collect_directory():
     assert {"scripts", "binaries", "datas"} <= attributes
     assert not any(item.arg == "exclude_binaries" and isinstance(item.value, ast.Constant)
                    and item.value.value for item in exe.keywords)
+
+
+def test_packaging_launcher_is_in_tools_and_resolves_from_project_root():
+    import ast
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / "TVScanStudio.spec").read_text(encoding="utf-8"))
+    analysis = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name) and node.func.id == "Analysis")
+    assert ast.literal_eval(analysis.args[0]) == ["tools/run_tv_scan_studio.py"]
+    assert (root / "tools/run_tv_scan_studio.py").is_file()
+    assert not (root / "run_tv_scan_studio.py").exists()

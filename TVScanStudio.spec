@@ -15,7 +15,7 @@ msvc_runtime = [
 ]
 
 a = Analysis(
-    ["run_tv_scan_studio.py"],
+    ["tools/run_tv_scan_studio.py"],
     pathex=["src"],
     binaries=msvc_runtime,
     datas=reportlab_data + tzdata_data,
