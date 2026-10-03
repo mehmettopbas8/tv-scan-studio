@@ -1142,7 +1142,6 @@ class StudioWindow:
         box.addWidget(self.result_empty)
         self.result_scatter = ResultScatterChart(page)
         self.result_scatter.selected.connect(self.open_result_details_by_id)
-        box.addWidget(self.result_scatter)
         self.results_table = Q.QTableWidget(0, 10)
         self.results_table.setHorizontalHeaderLabels(
             ["Görev", "Sembol", "TF", "Sınıf", "İşlem", "PF", "WR %", "DD %", "Net", "Kanıt"]
@@ -1162,6 +1161,7 @@ class StudioWindow:
         self.results_table.selectionModel().selectionChanged.connect(self.update_result_actions)
         self.results_table.doubleClicked.connect(self.show_result_details)
         box.addWidget(self.results_table, 2)
+        box.addWidget(self.result_scatter)
         box.addWidget(Q.QLabel("Son olaylar", objectName="subtitle"))
         self.result_events_empty = Q.QLabel("Henüz olay kaydı yok.", objectName="subtitle")
         self.result_events_empty.setSizePolicy(Q.QSizePolicy.Preferred, Q.QSizePolicy.Maximum)
@@ -2853,6 +2853,7 @@ class StudioWindow:
                         + visible_rows * self.results_table.verticalHeader().defaultSectionSize()
                         + self.results_table.frameWidth() * 2 + 12)
         self.results_table.setMaximumHeight(max(108, min(470, table_height)))
+        self.results_table.setMinimumHeight(max(108, min(240, table_height)))
         self.results_table.setVisible(bool(rows))
         self.result_empty.setVisible(not rows)
         if source_rows:

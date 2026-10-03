@@ -19,6 +19,29 @@ from tv_scan_studio.supervisor import WorkerAssignment
 from tv_scan_studio.tradingview import pine_source_hash
 
 
+def test_result_list_precedes_scatter_and_has_readable_height(tmp_path):
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = Store(tmp_path / "result-order.db")
+    project_id = store.create_project("Results", 'strategy("Results")')
+    store.enqueue(project_id, "visible", {"symbol": "OANDA:EURUSD", "timeframe": "15",
+                                         "inputs": {}})
+    task = store.claim_next(1)
+    store.complete(task.id, 1, {"trades": 80, "profit_factor": 1.8,
+        "max_drawdown_pct": 3, "net_profit": 100}, "hassas", verified=True)
+    studio = StudioWindow(store)
+    try:
+        studio.refresh_project_selectors()
+        studio.result_project.setCurrentIndex(studio.result_project.findData(project_id))
+        studio.refresh_results()
+        page_layout = studio.results_table.parentWidget().layout()
+        assert page_layout.indexOf(studio.results_table) < page_layout.indexOf(studio.result_scatter)
+        assert studio.results_table.rowCount() == 1
+        assert studio.results_table.minimumHeight() >= 108
+    finally:
+        studio.worker_timer.stop()
+        studio.window.close()
+
+
 def test_plan_direct_contract_quantity_mapping_and_scan(tmp_path):
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     store = Store(tmp_path / "quantity-plan.db")
