@@ -600,7 +600,7 @@ def pine_source_hash(source: str) -> str:
 
 def confirmed_strategy_identity_matches(strategy: dict[str, Any], identity: dict[str, Any],
                                         *, pine_hash: str, expected_title: str,
-                                        expected_input_count: int) -> bool:
+                                        expected_input_count: int, expected_source: str | None = None) -> bool:
     """Require confirmed Pine identity, accepting a legacy list with TV strategy properties."""
     observed = strategy.get("input_ids")
     saved = identity.get("input_ids")
@@ -614,11 +614,12 @@ def confirmed_strategy_identity_matches(strategy: dict[str, Any], identity: dict
         isinstance(identity.get("source_sha256"), str)
         and re.fullmatch(r"[0-9a-f]{64}", identity["source_sha256"])
         and identity.get("pine_digest") and identity.get("pine_version")
+        and isinstance(expected_source, str)
+        and identity["source_sha256"] == pine_source_hash(expected_source)
     )
     return bool(
         automatic_evidence_valid
-        and
-        strategy_structure_matches(strategy, expected_title, expected_input_count)
+        and strategy_structure_matches(strategy, expected_title, expected_input_count)
         and isinstance(observed, list) and isinstance(saved, list) and saved
         and all(isinstance(value, str) for value in observed)
         and len(observed) == len(set(observed))

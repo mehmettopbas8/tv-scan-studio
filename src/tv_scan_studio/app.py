@@ -1815,6 +1815,7 @@ class StudioWindow:
                     candidate, identity, pine_hash=project["pine_hash"],
                     expected_title=expected_title,
                     expected_input_count=len(expected_inputs),
+                    expected_source=project["pine_source"],
                 )
             )
         enabled = self.worker_table.item(row, 0)
@@ -1988,7 +1989,8 @@ class StudioWindow:
         matches = [strategy for strategy in strategies if strategy.get("id") == assignment.study_id]
         if len(matches) != 1 or not confirmed_strategy_identity_matches(
                 matches[0], identity, pine_hash=project["pine_hash"],
-                expected_title=expected_title, expected_input_count=expected_count):
+                expected_title=expected_title, expected_input_count=expected_count,
+                expected_source=project["pine_source"]):
             raise ValueError("Worker strateji/input kimliği değişti; görev uygulanmadı.")
 
     def _validate_live_worker_assignments(self, assignments):
@@ -2027,7 +2029,8 @@ class StudioWindow:
                        and strategy_structure_matches(strategy, expected_title, expected_count)]
             if (len(matches) != 1 or not confirmed_strategy_identity_matches(
                     matches[0], identity, pine_hash=project["pine_hash"],
-                    expected_title=expected_title, expected_input_count=expected_count)):
+                    expected_title=expected_title, expected_input_count=expected_count,
+                    expected_source=project["pine_source"])):
                 raise ValueError(
                     "Strateji kimliği, kullanıcı kaynak onayı veya input yapısı geçerli değil; "
                     "sekmeleri yeniden doğrulayın."
@@ -2377,6 +2380,7 @@ class StudioWindow:
                     source_confirmed = confirmed_strategy_identity_matches(
                         strategy, identity, pine_hash=project["pine_hash"],
                         expected_title=expected_title, expected_input_count=expected_count,
+                        expected_source=project["pine_source"],
                     )
                     evidence_label = "kaynak onaylı" if source_confirmed else "kaynak onayı gerekli"
                     matches.append((f"{expected_title} · {context} · Grafik sekmesi {tab_index} · {evidence_label}",

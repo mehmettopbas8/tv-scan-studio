@@ -113,11 +113,14 @@ def test_automatic_source_evidence_requires_hash_and_bound_build():
     strategy = {"name":"Demo", "pine_id":"USER;one", "input_ids":["in_0"],
                 "pine_digest":"build", "pine_version":"1.0"}
     identity = {**strategy, "pine_hash":"project", "user_source_confirmed":True,
-                "source_verification":"editor_saved_source_sha256", "source_sha256":"a"*64}
-    def check(saved):
+                "source_verification":"editor_saved_source_sha256", "source_sha256":pine_source_hash('strategy("Demo")')}
+    def check(saved, source='strategy("Demo")'):
         return confirmed_strategy_identity_matches(strategy,saved,pine_hash="project",
-            expected_title="Demo",expected_input_count=1)
+            expected_title="Demo",expected_input_count=1,expected_source=source)
     assert check(identity)
     for key in ("source_sha256","pine_digest","pine_version"):
         assert not check({**identity,key:None})
     assert not check({**identity,"source_sha256":"partial"})
+    assert not check({**identity,"source_sha256":"a"*64})
+    assert not check(identity, 'strategy("Different")')
+    assert not check(identity, None)
