@@ -76,13 +76,16 @@ eşleşmeli, ilk kullanımda kalıcı `pine_id` ve yerel Pine kaynağı
 eşlemesi doğrulanmalıdır. Başlatma onayından sonra sekme ve kimlik yeniden salt
 okunur doğrulanır; kaydedilmiş kimlik veya input yapısı değişirse worker kilidi yeniden devreye girer;
 uygulama belirsiz bir grafiğe otomatik kod yapıştırmaz veya mevcut çalışmayı gizlemez.
-Bağımsız worker sekmesinde bağlı stratejinin Pine editörü açıksa uygulama aynı
+Bağımsız worker sekmesinde kaynak bağlama sırasında uygulama aynı
 Pine ID/sürüme ait kayıtlı tam kaynak metnini okuyup proje koduyla SHA-256
 üzerinden karşılaştırabilir. Yalnız satır sonları normalleştirilir; kod ve diğer
 boşluklar korunur. Farklı kaynak veya okuma sırasında değişen derleme kimliği
-bağlamayı engeller. Editör kapalıysa veya tam metin güvenle okunamıyorsa açık
+bağlamayı engeller. Editör kapalıysa yalnız güvenle bağlanmış worker layoutunda
+Pine paneli geçici açılır; tam metin okunduktan sonra kapandığı doğrulanır.
+Çalışan tarama sırasında kaynak bağlanmaz. Açık editör veya başka bir iletişim
+kutusu değiştirilmez. Tam metin güvenle okunamıyorsa açık
 kullanıcı onayı gerekir; bu onay otomatik kaynak eşitliği kanıtı değildir.
-Uygulama editörü henüz kendiliğinden açmaz. Kaydedilmemiş editör taslağı
+Panelin kapanması doğrulanamazsa bağlama reddedilir. Kaydedilmemiş editör taslağı
 uygulanmış stratejinin kaynak kanıtı olarak kullanılmaz.
 TradingView'in sekmeler arası layout/bulut eşitlemesinin mevcut grafikleri nasıl
 etkilediği canlı test edilmeden ayrıca doğrulanmış sayılmaz.

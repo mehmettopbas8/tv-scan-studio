@@ -21,7 +21,7 @@ from .backup import create_backup, verify_backup
 from .resources import project_worker_throughput, recommend_workers, system_snapshot
 from .supervisor import WorkerAssignment, WorkerSupervisor
 from .tradingview import (GncZihinDriver, confirmed_strategy_identity_matches,
-                          TradingViewError, pine_source_hash, strategy_structure_matches)
+                          TradingViewError, SourceReadUnavailable, pine_source_hash, strategy_structure_matches)
 from .windows import (TabCreationError, cdp_healthy, chart_targets, find_tradingview_executables,
                       launch_with_cdp, open_chart_tabs, worker_layout_candidates)
 from .storage import Store
@@ -1852,6 +1852,8 @@ class StudioWindow:
 
     def bind_selected_strategy(self):
         try:
+            if self.supervisor and self.supervisor.running:
+                raise ValueError("Kaynak doğrulamadan önce çalışan workerları durdurun.")
             row = self.worker_table.currentRow()
             project_widget = self.worker_table.cellWidget(row, 3) if row >= 0 else None
             project_id = project_widget.currentData() if project_widget else None
@@ -1867,8 +1869,10 @@ class StudioWindow:
             reader = getattr(self.driver, "strategy_source_hash", None)
             if callable(reader) and target_id in self._safe_worker_targets:
                 try:
-                    automatic_source_hash = reader(target_id, strategy["id"])
-                except TradingViewError:
+                    opener = getattr(self.driver, "ensure_strategy_source_hash", None)
+                    automatic_source_hash = (opener(target_id, strategy["id"], guard=self._guard_worker_layout)
+                                             if callable(opener) else reader(target_id, strategy["id"]))
+                except SourceReadUnavailable:
                     pass  # An unavailable editor is not a match or a mismatch.
             if (automatic_source_hash is not None
                     and automatic_source_hash != pine_source_hash(project["pine_source"])):
@@ -1883,7 +1887,7 @@ class StudioWindow:
                     raise ValueError("Kaynak okunurken strateji kimliği değişti; worker bağlanmadı.")
             answer = self.QtWidgets.QMessageBox.Yes if automatic_source_hash else self.QtWidgets.QMessageBox.question(
                 self.window, "Strateji kaynağını kontrol et",
-                "Uygulama grafikteki Pine kodunun tamamını otomatik karşılaştıramıyor. "
+                "Bu sekmedeki tam Pine kaynağı otomatik doğrulanamadı. "
                 "Bu çalışma sekmesindeki stratejinin projeye yapıştırdığınız kodla aynı "
                 "olduğunu TradingView'de kontrol ettiniz mi?"
             )
@@ -1900,7 +1904,7 @@ class StudioWindow:
                 "source_sha256": automatic_source_hash,
             }})
             self.discover_targets()
-        except ValueError as exc:
+        except (ValueError, TradingViewError) as exc:
             self.worker_status.setStyleSheet(f"color:{STATUS_ERROR}"); self.worker_status.setText(str(exc))
 
     def start_workers(self):

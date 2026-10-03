@@ -59,6 +59,17 @@ def test_worker_binding_checks_automatic_saved_source(tmp_path, monkeypatch, dif
     studio.window.close()
 
 
+def test_source_binding_is_disabled_during_active_scan(tmp_path):
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = Store(tmp_path / "active-source.db")
+    studio = StudioWindow(store)
+    studio.supervisor = SimpleNamespace(running=True)
+    studio.bind_selected_strategy()
+    assert "workerları durdurun" in studio.worker_status.text()
+    studio.supervisor = None
+    studio.window.close()
+
+
 def test_app_builds_operational_controls_and_cost_mapping(tmp_path):
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     studio = StudioWindow(Store(tmp_path / "studio.db"))
@@ -1297,7 +1308,9 @@ def test_worker_binding_records_explicit_user_source_confirmation(tmp_path, monk
     studio.bind_selected_strategy()
     identity = store.settings(project_id)["tradingview_identity"]
     assert identity["user_source_confirmed"] is True
-    assert "otomatik karşılaştıramıyor" in prompts[0]
+    assert "otomatik doğrulanamadı" in prompts[0]
+    assert identity["source_verification"] == "user_confirmation"
+    assert identity["source_sha256"] is None
     studio.worker_timer.stop()
     studio.window.close()
 

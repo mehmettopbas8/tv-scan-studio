@@ -1,7 +1,67 @@
 from tv_scan_studio.tradingview import (GncZihinDriver, confirmed_strategy_identity_matches,
                                         strategy_structure_matches)
 import pytest
-from tv_scan_studio.tradingview import TradingViewError, pine_source_hash
+from tv_scan_studio.tradingview import TradingViewError, SourceReadUnavailable, pine_source_hash
+
+
+def test_source_panel_is_opened_and_restored_only_when_needed(monkeypatch):
+    driver = GncZihinDriver()
+    reads = iter([None, "hash"])
+    def read(*_args):
+        value = next(reads)
+        if value is None:
+            raise SourceReadUnavailable("closed")
+        return value
+    actions, guards = [], []
+    monkeypatch.setattr(driver, "strategy_source_hash", read)
+    monkeypatch.setattr(driver._motor, "_eval", lambda _target, expression: actions.append(expression) or True)
+    assert driver.ensure_strategy_source_hash("worker", "sid", guard=guards.append) == "hash"
+    assert len(actions) == 3
+    assert 'aria-label="Pine"' in actions[0]
+    assert 'aria-label="Close"' in actions[1]
+    assert guards == ["worker"] * 5
+
+
+def test_source_panel_is_not_changed_when_source_already_readable(monkeypatch):
+    driver = GncZihinDriver()
+    monkeypatch.setattr(driver, "strategy_source_hash", lambda *_args: "hash")
+    monkeypatch.setattr(driver._motor, "_eval", lambda *_args: pytest.fail("No panel mutation permitted"))
+    assert driver.ensure_strategy_source_hash("worker", "sid", guard=lambda _target: None) == "hash"
+
+
+def test_source_panel_preserves_existing_editor_or_modal(monkeypatch):
+    driver = GncZihinDriver()
+    monkeypatch.setattr(driver, "strategy_source_hash", lambda *_args: (_ for _ in ()).throw(SourceReadUnavailable("unavailable")))
+    actions = []
+    monkeypatch.setattr(driver._motor, "_eval", lambda _target, expression: actions.append(expression) or False)
+    with pytest.raises(SourceReadUnavailable, match="korunuyor"):
+        driver.ensure_strategy_source_hash("worker", "sid", guard=lambda _target: None)
+    assert len(actions) == 1
+
+
+def test_source_panel_restore_failure_is_not_manual_confirmation_fallback(monkeypatch):
+    driver = GncZihinDriver()
+    reads = iter([None, "hash"])
+    def read(*_args):
+        result = next(reads)
+        if result is None:
+            raise SourceReadUnavailable("closed")
+        return result
+    monkeypatch.setattr(driver, "strategy_source_hash", read)
+    actions = iter([True, False])
+    monkeypatch.setattr(driver._motor, "_eval", lambda *_args: next(actions))
+    with pytest.raises(TradingViewError, match="kapatılamadı") as error:
+        driver.ensure_strategy_source_hash("worker", "sid", guard=lambda _target: None)
+    assert not isinstance(error.value, SourceReadUnavailable)
+
+
+def test_source_panel_guard_rejection_prevents_open(monkeypatch):
+    driver = GncZihinDriver()
+    monkeypatch.setattr(driver._motor, "_eval", lambda *_args: pytest.fail("Wrong worker must not be touched"))
+    def reject(_target):
+        raise ValueError("layout changed")
+    with pytest.raises(ValueError, match="layout changed"):
+        driver.ensure_strategy_source_hash("worker", "sid", guard=reject)
 
 
 def test_source_hash_normalizes_only_line_endings():

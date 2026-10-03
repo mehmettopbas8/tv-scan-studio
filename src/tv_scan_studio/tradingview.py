@@ -19,6 +19,10 @@ class TradingViewError(RuntimeError):
     pass
 
 
+class SourceReadUnavailable(TradingViewError):
+    """No authoritative source was available, without an unsafe UI outcome."""
+
+
 def chart_resolution(timeframe: str) -> str:
     """Convert user-friendly minute/hour labels to TradingView chart resolutions.
 
@@ -330,8 +334,65 @@ class GncZihinDriver:
         })()'''.replace('STUDY_ID', json.dumps(study_id)))
         if (not isinstance(data, dict) or not isinstance(data.get("source"), str)
                 or not data["source"] or not data.get("pine_id") or not data.get("version")):
-            raise TradingViewError("Bağlı stratejinin tam Pine kaynağı okunamadı; kaynak eşleşmesi doğrulanmadı.")
+            raise SourceReadUnavailable("Bağlı stratejinin tam Pine kaynağı okunamadı; kaynak eşleşmesi doğrulanmadı.")
         return pine_source_hash(data["source"])
+
+    def ensure_strategy_source_hash(self, target_id: str, study_id: str,
+                                    *, guard: Callable[[str], None]) -> str:
+        """Read a bound source, temporarily opening only a closed worker editor."""
+        guard(target_id)
+        try:
+            return self.strategy_source_hash(target_id, study_id)
+        except SourceReadUnavailable:
+            pass
+        guard(target_id)
+        opened = self._motor._eval(target_id, r'''(()=>{
+          const visible=e=>e.offsetWidth>0&&e.offsetHeight>0
+            &&getComputedStyle(e).visibility!=='hidden';
+          if([...document.querySelectorAll('.monaco-editor,[role="dialog"],.js-dialog')]
+            .some(visible))return false;
+          const buttons=[...document.querySelectorAll('button[aria-label="Pine"]')]
+            .filter(visible);
+          if(buttons.length!==1||buttons[0].disabled)return false;
+          buttons[0].click();return true;
+        })()''')
+        if opened is not True:
+            raise SourceReadUnavailable("Pine paneli güvenle açılamadı; mevcut editör korunuyor.")
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                guard(target_id)
+                try:
+                    return self.strategy_source_hash(target_id, study_id)
+                except SourceReadUnavailable:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.15)
+        finally:
+            guard(target_id)
+            closed = self._motor._eval(target_id, r'''(()=>{
+              const visible=e=>e.offsetWidth>0&&e.offsetHeight>0
+                &&getComputedStyle(e).visibility!=='hidden';
+              const editors=[...document.querySelectorAll('.monaco-editor')].filter(visible);
+              if(editors.length!==1)return false;
+              const panel=editors[0].closest('[role="dialog"],.js-dialog');
+              if(!panel)return false;
+              const buttons=[...panel.querySelectorAll('button[aria-label="Close"]')].filter(visible);
+              if(buttons.length!==1)return false;
+              buttons[0].click();return true;
+            })()''')
+            if closed is not True:
+                raise TradingViewError("Kaynak paneli kapatılamadı; worker bağlanmadı, Pine panelini kontrol edin.")
+            for _attempt in range(5):
+                guard(target_id)
+                confirmed_closed = self._motor._eval(target_id, r'''(()=>
+                  ![...document.querySelectorAll('.monaco-editor')].some(e=>
+                    e.offsetWidth>0&&e.offsetHeight>0&&getComputedStyle(e).visibility!=='hidden'))()''')
+                if confirmed_closed is True:
+                    break
+                time.sleep(.1)
+            else:
+                raise TradingViewError("Pine panelinin kapandığı doğrulanamadı; worker bağlanmadı.")
 
     def _eval(self, target_id: str, study_id: str, body: str) -> Any:
         prefix = (
