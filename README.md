@@ -164,10 +164,6 @@ tv-scan-studio/
 ├── TVScanStudio.spec                PyInstaller Windows paket tanımı
 ├── .github/workflows/
 │   └── windows-build.yml            Windows test, paket ve etiketli yayın hattı
-├── docs/
-│   ├── USER_ACCEPTANCE_RUNBOOK.md   Ekran başında kullanıcı kabul adımları
-│   ├── DATE_RANGE_DRIVER_CONTRACT.md Tarihli görevlerin kanıt sözleşmesi
-│   └── ADR-001-python-pyside6.md    Teknoloji seçimi ve gerekçesi
 ├── src/tv_scan_studio/              Uygulama kaynakları
 │   ├── app.py                      Sayfalar, kullanıcı eylemleri ve giriş noktası
 │   ├── ui_controls.py              Yeniden kullanılan arayüz kontrolleri
@@ -208,13 +204,13 @@ Arayüz eylemleri `app.py` üzerinden planlamayı ve worker koordinasyonunu ça�
 
 ## Dokümantasyon
 
-- [Kullanıcı kabul rehberi](docs/USER_ACCEPTANCE_RUNBOOK.md): Ekran başında denenmesi gereken adımlar, beklenen davranışlar ve kanıt kaydı. Tek başına canlı test izni değildir.
-- [Tarih aralığı sürücü sözleşmesi](docs/DATE_RANGE_DRIVER_CONTRACT.md): Deep rapor tazeliği, tarih/input/maliyet eşleşmesi ve hata halinde durma kuralları. Güncel durum ile tarihsel geliştirme notları ayrı okunmalıdır.
-- [ADR-001: Python ve PySide6](docs/ADR-001-python-pyside6.md): Teknoloji seçiminin bağlamı ve sonuçları; ayrıntılı güncel kurulum için bu README esas alınır.
+- Kurulum, kullanım, dosya yapısı ve geliştirici komutları bu README'de yer alır.
 - [Değişiklik günlüğü](CHANGELOG.md): Sürümler arasındaki değişiklikler.
 - [Lisans](LICENSE): AGPL-3.0-only koşulları.
 
 Yeni davranış eklerken ilgili testleri ve kullanıcıya görünen kullanım açıklamasını birlikte güncelleyin. Kaynak testi, gerçek chart testi, portable paket testi ve canlı kabul kanıtlarını birbirinden ayırın. Kişisel strateji, hesap bilgisi veya yerel kabul kayıtlarını public dokümantasyona eklemeyin.
+
+İç kabul rehberleri, canlı test günlükleri ve geliştirme karar notları public depoya dahil edilmez. `tests/` ise doküman/sonuç arşivi değil, ürün davranışını ve CI'yi doğrulayan test kaynak kodudur.
 
 ## Testler
 
@@ -258,7 +254,7 @@ if ($process.ExitCode -ne 0) { throw "Portable UI smoke testi başarısız." }
 
 Bu araç **yeni sekme açmaz veya TradingView'i yeniden başlatmaz**. Var olan iki worker layoutunu keşfeder, her birinde görünen adla tek hazır strateji bulur ve geçici veritabanında iki görev çalıştırır. Her worker kendi mevcut sembol/timeframe ve ilk input değerini yeniden uygular. Başka layout veya açık Replay görürse durur.
 
-`--vary-first-input` ayrıca ikinci workerda ilk tam sayı inputunu bir artırır; bu seçenek canlı ayar değiştirir ve test bitiminde otomatik geri alma sağlamaz. Yalnız uygun inputta ve açık test kararıyla kullanın, önceki değerleri kaydedip test sonunda kontrol edin. Normal uygulamanın kaynak eşlemesi ve bütün kabul kapıları, bu küçük geliştirici testiyle tamamlanmış sayılmaz. Ayrıntılı senaryo için kullanıcı kabul rehberini izleyin.
+`--vary-first-input` ayrıca ikinci workerda ilk tam sayı inputunu bir artırır; bu seçenek canlı ayar değiştirir ve test bitiminde otomatik geri alma sağlamaz. Yalnız uygun inputta ve açık test kararıyla kullanın, önceki değerleri kaydedip test sonunda kontrol edin. Normal uygulamanın kaynak eşlemesi ve bütün kabul kapıları, bu küçük geliştirici testiyle tamamlanmış sayılmaz.
 
 ## Portable paket oluşturma
 

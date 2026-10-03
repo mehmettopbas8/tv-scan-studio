@@ -24,6 +24,9 @@ output-local-*/
 src/tv_scan_studio/data/ftmo_session_20260923.json
 src/tv_scan_studio/data/ftmo_overnight_33075.jsonl.gz
 # Local acceptance evidence and live-account inspection helpers are not release source.
+docs/USER_ACCEPTANCE_RUNBOOK.md
+docs/DATE_RANGE_DRIVER_CONTRACT.md
+docs/ADR-001-python-pyside6.md
 docs/IMPLEMENTATION_STATUS.md
 docs/ALGOGRAPH_UI_AND_COMPLETION_PLAN.md
 docs/ORIGINAL_MVP_ACCEPTANCE_AUDIT.md
