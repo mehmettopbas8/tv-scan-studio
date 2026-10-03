@@ -8,6 +8,8 @@
 - Added FTMO profiles, editable cost assumptions and staged robustness validation.
 - Reject fixed direct-input order quantity conflicts with the default Properties quantity; preserve explicit quantity scans and document the limits of computed-sizing verification.
 - Added interactive trade analytics, preset comparison, CSV/Excel export and success-only PDF reports, plus checksummed backups.
+- Added new-file-only backup restoration with SQLite, foreign-key and project/Pine consistency validation; backup sources now come from the same database snapshot. The active database is never replaced or switched by restoration.
+- Preserve exact Pine line endings in new backups and support the known text-mode newline conversion in legacy Windows backups without accepting unrelated source changes.
 - Prioritized the result list before the scatter chart and retained a readable minimum table height on compact result pages.
 - Added task-bound dated Deep reports with fresh XLSX identity/input/cost verification and Strategy Properties commission/slippage application.
 - Restored saved scan settings on project selection, isolated project defaults, and corrected minute/hour resolution mapping.

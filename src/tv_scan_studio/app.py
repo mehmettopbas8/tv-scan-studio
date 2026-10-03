@@ -17,7 +17,7 @@ from .pine import parse_strategy_inputs, strategy_title
 from .planner import ScanPlan, enqueue_plan
 from .export import (export_results_csv, export_task_csv, export_task_xlsx,
                      export_project_task_scope)
-from .backup import create_backup, verify_backup
+from .backup import create_backup, verify_backup, restore_backup
 from .resources import project_worker_throughput, recommend_workers, system_snapshot
 from .supervisor import WorkerAssignment, WorkerSupervisor
 from .tradingview import (GncZihinDriver, confirmed_strategy_identity_matches,
@@ -672,9 +672,16 @@ class StudioWindow:
         operational.addWidget(self.throughput_label); operational.addWidget(self.eta_label); operational.addWidget(self.candidate_label)
         operational.addWidget(self.resource_label)
         operational.addStretch()
-        backup = Q.QPushButton("Yedek oluştur"); backup.clicked.connect(self.create_portable_backup)
-        operational.addWidget(backup)
         box.addWidget(self.dashboard_operational)
+        backup_actions = Q.QHBoxLayout()
+        backup_actions.addStretch()
+        backup = Q.QPushButton("Yedek oluştur"); backup.clicked.connect(self.create_portable_backup)
+        backup_actions.addWidget(backup)
+        self.restore_backup_button = Q.QPushButton("Yedeği yeni dosyaya aç")
+        self.restore_backup_button.setToolTip("Mevcut veriyi değiştirmeden yeni bir veritabanı dosyası oluşturur.")
+        self.restore_backup_button.clicked.connect(self.restore_portable_backup)
+        backup_actions.addWidget(self.restore_backup_button)
+        box.addLayout(backup_actions)
         self.dashboard_setup = Q.QFrame(objectName="metric")
         setup_layout = Q.QVBoxLayout(self.dashboard_setup)
         self.dashboard_setup_title = Q.QLabel("İlk taramanı kur")
@@ -3442,6 +3449,24 @@ class StudioWindow:
             self.dashboard_status.setText(f"Yedek doğrulandı · {manifest['project_count']} proje")
         except Exception as exc:
             self.dashboard_status.setText(f"Yedekleme başarısız: {exc}")
+
+    def restore_portable_backup(self):
+        source, _ = self.QtWidgets.QFileDialog.getOpenFileName(
+            self.window, "Geri yüklenecek yedeği seçin", "", "TV Scan yedeği (*.tvscan.zip *.zip)")
+        if not source:
+            return
+        destination, _ = self.QtWidgets.QFileDialog.getSaveFileName(
+            self.window, "Yeni veritabanı dosyası seçin (mevcut dosyanın üzerine yazılmaz)",
+            "tv-scan-studio-restored.db", "SQLite veritabanı (*.db)")
+        if not destination:
+            return
+        try:
+            manifest = restore_backup(source, destination)
+            self.dashboard_status.setText(
+                f"Yedek yeni dosyaya açıldı · {manifest['project_count']} proje · {destination}. "
+                "Mevcut uygulama veritabanı değiştirilmedi; yeni dosyaya otomatik geçilmedi.")
+        except Exception as exc:
+            self.dashboard_status.setText(f"Geri yükleme başarısız: {exc}")
 
     def measure_resources(self):
         try:

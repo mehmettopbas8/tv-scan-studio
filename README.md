@@ -30,6 +30,7 @@ TradingView Desktop üzerindeki Pine stratejilerinin input kombinasyonlarını y
 - İsteğe bağlı yerel araştırma kataloğu ve tarihsel arşiv görünümü; özel araştırma verileri açık kaynak ve portable dağıtıma dahil değildir
 - Aynı ayar/dönemle alternatif sağlayıcı görevi hazırlama; ilişkili inputları birlikte tutan kontrollü varyantlar
 - Checksum doğrulamalı SQLite + Pine kaynak yedeği
+- Yedeği mevcut dosyanın üzerine yazmadan yeni veritabanı dosyasına açma
 - Windows bildirimleri ve tamamen yerel ayarlar; telemetri/kullanıcı hesabı yok
 
 ## Geliştirme
@@ -69,6 +70,13 @@ kapanırsa yarım kalan görevler yeniden bekleme kuyruğuna alınır.
 
 Temel kriterleri geçen tek ölçüm `hassas` kabul edilir. `dayanıklı` sınıfı için
 komşu değer, maliyet stresi ve farklı sağlayıcı kontrollerinin üçü de gerekir.
+
+Tarama masasındaki `Yedeği yeni dosyaya aç` eylemi önce yedek ZIP'ini, ardından
+yeni bir `.db` dosyası konumunu ister. Checksum, SQLite bütünlüğü, proje/görev
+ilişkileri ve Pine kaynaklarının veritabanıyla tutarlılığı kontrol edilir.
+Mevcut dosya seçilirse işlem reddedilir. Bu eylem açık uygulamanın veritabanını
+değiştirmez ve yeni dosyaya otomatik geçiş yapmaz. Yarım kalmış görevler dosyada
+korunur; normal uygulama açılışında kuyruğa döndürülür.
 
 Strateji emirlerinde miktar doğrudan bir Pine inputundan (örneğin `Contracts`)
 alınıyorsa TradingView'in varsayılan pozisyon alanı bu miktarı değiştirmez.

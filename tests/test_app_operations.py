@@ -19,6 +19,39 @@ from tv_scan_studio.supervisor import WorkerAssignment
 from tv_scan_studio.tradingview import pine_source_hash
 
 
+@pytest.mark.parametrize("existing_destination,cancel", [(False, False), (True, False), (False, True)])
+def test_restore_ui_preserves_active_store(tmp_path, monkeypatch, existing_destination, cancel):
+    from tv_scan_studio.backup import create_backup
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    archived = Store(tmp_path / "archived.db")
+    archived.create_project("Archived", 'strategy("Archived")')
+    source = tmp_path / "backup.tvscan.zip"
+    create_backup(archived, source)
+    active = Store(tmp_path / "active.db")
+    studio = StudioWindow(active)
+    destination = tmp_path / "restored.db"
+    if existing_destination:
+        Store(destination).create_project("Preserved", 'strategy("Preserved")')
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *a: (str(source), ""))
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        lambda *a: ("" if cancel else str(destination), ""))
+    try:
+        studio.restore_portable_backup()
+        assert studio.store.path == active.path
+        assert active.projects() == []
+        if cancel:
+            assert not destination.exists()
+        elif existing_destination:
+            assert "başarısız" in studio.dashboard_status.text()
+            assert Store(destination).projects()[0]["name"] == "Preserved"
+        else:
+            assert Store(destination).projects()[0]["name"] == "Archived"
+            assert "otomatik geçilmedi" in studio.dashboard_status.text()
+    finally:
+        studio.worker_timer.stop()
+        studio.window.close()
+
+
 def test_result_list_precedes_scatter_and_has_readable_height(tmp_path):
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     store = Store(tmp_path / "result-order.db")
