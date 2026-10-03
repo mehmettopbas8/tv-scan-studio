@@ -117,13 +117,24 @@ jobs:
           name: TV-Scan-Studio-windows-x64
           path: dist
       - name: Publish tagged release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${{ github.ref_name }}"
-          dist/TV-Scan-Studio-0.2.0.exe
-          dist/TV-Scan-Studio-0.2.0.exe.sha256
-          dist/TV-Scan-Studio-0.2.0-portable.zip
-          dist/TV-Scan-Studio-0.2.0-portable.zip.sha256
-          --title "TV Scan Studio ${{ github.ref_name }}"
-          --generate-notes
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $releaseArgs = @(
+            'release', 'create', $env:RELEASE_TAG,
+            'dist/TV-Scan-Studio-0.2.0.exe',
+            'dist/TV-Scan-Studio-0.2.0.exe.sha256',
+            'dist/TV-Scan-Studio-0.2.0-portable.zip',
+            'dist/TV-Scan-Studio-0.2.0-portable.zip.sha256',
+            '--verify-tag', '--title', "TV Scan Studio $env:RELEASE_TAG"
+          )
+          if ($env:RELEASE_TAG.Contains('-')) {
+            $notes = 'Windows x64 release candidate. Run the single EXE; no Python installation or adjacent _internal directory is required. Verify SHA-256 before running. The package is unsigned and may trigger SmartScreen. Live packaged-worker interruption/recovery and broader user acceptance remain incomplete; this is not a stable release. Back up your local database before upgrading. See README for download and first-run instructions.'
+            $releaseArgs += @('--prerelease', '--latest=false', '--notes', $notes)
+          } else {
+            $releaseArgs += '--generate-notes'
+          }
+          & gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

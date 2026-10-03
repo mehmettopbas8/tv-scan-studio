@@ -49,7 +49,7 @@ Kurulum sihirbazı yoktur: **indir → doğrula → EXE'ye çift tıkla**. Pytho
 4. İndirilen artefakt ZIP'ine sağ tıklayıp `Tümünü ayıkla` seçin. Çıkan dosyalar arasından sürüm numaralı `.exe` ve ona ait `.exe.sha256` dosyasını kullanın. Yanındaki `portable.zip` alternatif dağıtım kopyasıdır; iki ayrı uygulama kurmanız gerekmez.
 5. Bu paket bir **CI geliştirme çıktısıdır**, yayımlanmış kararlı sürüm değildir. Otomatik testlerin geçmesi bütün canlı kullanıcı kabulünün tamamlandığı anlamına gelmez.
 
-3 Ekim 2026 itibarıyla Release henüz yayımlanmamıştır; yukarıdaki Actions yolu kullanılabilir. Bir EXE size doğrudan verildiyse de aşağıdaki doğrulama ve ilk açılış adımlarını izleyin.
+Releases sayfasında paket yoksa yukarıdaki Actions yolu kullanılabilir. Bir EXE size doğrudan verildiyse de aşağıdaki doğrulama ve ilk açılış adımlarını izleyin.
 
 #### 2. Dosyayı doğrulama
 
