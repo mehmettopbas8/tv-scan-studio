@@ -9,6 +9,14 @@ dist/
 build-*/
 dist-*/
 *.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+.coverage
+htmlcov/
 screenshots/
 tmp/
 output/

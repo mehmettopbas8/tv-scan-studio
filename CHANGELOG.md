@@ -2,6 +2,7 @@
 
 ## 0.2.0 — release candidate, not yet published
 
+- Package Windows builds as a single self-contained EXE; publish direct EXE/checksum and an optional one-EXE ZIP, without an adjacent `_internal` folder. Runtime extraction uses the Windows temporary directory; persistent user data stays in AppData.
 - Added multi-project worker assignment on chart tabs sharing the single CDP 9222 session.
 - Added persistent Pine identity and source-hash binding, including guarded temporary opening/restoration of a closed worker Pine panel. Existing editors are preserved; unavailable source still requires explicit user confirmation and is not automatic equality evidence.
 - Added operational dashboard controls, retry/recovery, resource projections and worker restart supervision.
