@@ -286,6 +286,10 @@ def test_fresh_xlsx_claim_ignores_old_file_and_requires_one_stable_new_file(tmp_
     new = tmp_path / "report.xlsx"
     with zipfile.ZipFile(new, "w") as archive:
         archive.writestr("new", "data")
+    # This fixture tests a known-fresh file, not Windows clock precision.
+    # Python 3.13's wall clock can be ahead of the filesystem's timestamp tick.
+    import os
+    os.utime(new, ns=(started_ns + 1_000_000_000, started_ns + 1_000_000_000))
     assert wait_for_unique_fresh_xlsx(
         tmp_path, baseline=baseline, started_ns=started_ns,
         timeout=1, poll_interval=0.01,
