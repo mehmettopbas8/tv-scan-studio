@@ -305,6 +305,20 @@ def test_fresh_xlsx_claim_fails_closed_on_ambiguous_downloads(tmp_path):
         )
 
 
+def test_new_competing_file_is_not_hidden_by_older_timestamp(tmp_path):
+    import os
+    baseline = xlsx_download_baseline(tmp_path)
+    started_ns = time.time_ns()
+    for name, offset in [('first.xlsx', -1_000_000_000), ('second.xlsx', 1_000_000_000)]:
+        path = tmp_path / name
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('data', name)
+        os.utime(path, ns=(started_ns + offset, started_ns + offset))
+    with pytest.raises(DeepExportError, match='birden fazla'):
+        wait_for_unique_fresh_xlsx(tmp_path, baseline=baseline, started_ns=started_ns,
+                                  timeout=1, poll_interval=.01)
+
+
 def test_fresh_xlsx_claim_rejects_old_or_incomplete_file(tmp_path):
     baseline = xlsx_download_baseline(tmp_path)
     started_ns = time.time_ns()

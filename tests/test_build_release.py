@@ -22,3 +22,20 @@ def test_release_rejects_private_research_files_before_writing(tmp_path: Path, f
         build_release(source, output, "0.2.0")
 
     assert not output.exists()
+
+
+@pytest.mark.parametrize('relative_path', [
+    'studio.db', 'saved.sqlite', 'saved.sqlite3', 'studio.db-wal', 'studio.db-shm',
+    '.env', 'screenshots/chart.png', 'backups/user.zip', '.git/config',
+])
+def test_release_rejects_local_user_artifacts(tmp_path, relative_path):
+    source = tmp_path / 'TV-Scan-Studio'
+    source.mkdir()
+    (source / 'TV-Scan-Studio.exe').write_bytes(b'exe')
+    artifact = source / relative_path
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b'private user artifact')
+    output = tmp_path / 'release'
+    with pytest.raises(ValueError, match='Yerel kullanıcı verisi'):
+        build_release(source, output, '0.2.0')
+    assert not output.exists()

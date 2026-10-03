@@ -61,6 +61,7 @@ def wait_for_unique_fresh_xlsx(directory: str | Path, *, baseline: frozenset[str
     stable = 0
     while clock.monotonic() < deadline:
         candidates: list[tuple[Path, int, int]] = []
+        new_files: list[Path] = []
         for item in folder.iterdir():
             if item.name in baseline or item.suffix.lower() != ".xlsx":
                 continue
@@ -68,11 +69,15 @@ def wait_for_unique_fresh_xlsx(directory: str | Path, *, baseline: frozenset[str
                 stat = item.stat()
             except OSError:
                 continue
+            if item.is_file():
+                new_files.append(item)
             # Windows may give a new file the same timestamp tick as the click.
             # The pre-click filename baseline is the primary freshness guard.
             if item.is_file() and stat.st_mtime_ns >= started_ns:
                 candidates.append((item, stat.st_size, stat.st_mtime_ns))
-        if len(candidates) > 1:
+        # Count every file absent from the baseline before applying the timestamp
+        # gate. Clock/filesystem precision must not conceal a competing download.
+        if len(new_files) > 1:
             raise DeepExportError("Aynı anda birden fazla yeni XLSX bulundu; indirme belirsiz.")
         if candidates:
             item, size, mtime_ns = candidates[0]

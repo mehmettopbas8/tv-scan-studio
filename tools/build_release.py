@@ -15,6 +15,14 @@ def build_release(source: Path, output_dir: Path, version: str) -> tuple[Path, P
     private_files = [path for path in source.rglob("*") if path.name in PRIVATE_RESEARCH_FILES]
     if private_files:
         raise ValueError("Özel araştırma verisi taşınabilir pakete eklenemez.")
+    local_files = [path for path in source.rglob("*") if path.is_file() and (
+        path.name.lower() in {".env", "studio.db-wal", "studio.db-shm"}
+        or path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+        or any(part.lower() in {".git", "screenshots", "backups"}
+               for part in path.relative_to(source).parts[:-1])
+    )]
+    if local_files:
+        raise ValueError("Yerel kullanıcı verisi taşınabilir pakete eklenemez.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_base = output_dir / f"TV-Scan-Studio-{version}-portable"
