@@ -6,9 +6,10 @@ import json
 import hashlib
 import sqlite3
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 SCHEMA = """
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS event_log (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS event_log_created_idx ON event_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS event_log_task_idx ON event_log(task_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS validation_links (
     parent_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     child_task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
@@ -92,6 +94,16 @@ class ClaimedTask:
     attempts: int
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Keep transaction semantics while releasing Windows SQLite file locks."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -111,7 +123,8 @@ class Store:
                 connection.execute("UPDATE projects SET pine_hash=? WHERE id=?", (digest, row["id"]))
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None,
+                                     factory=_ClosingConnection)
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.row_factory = sqlite3.Row
@@ -402,7 +415,7 @@ class Store:
             self._refresh_project_status(connection, int(row["project_id"]))
             connection.commit()
 
-    def results(self, project_id: int, classification: str | None = None) -> list[dict[str, Any]]:
+    def results(self, project_id: int, classification: str | Iterable[str] | None = None) -> list[dict[str, Any]]:
         query = (
             "SELECT t.id task_id,t.task_key,t.payload,r.metrics,r.classification,r.verified,r.created_at,e.evidence "
             "FROM results r JOIN tasks t ON t.id=r.task_id "
@@ -410,8 +423,11 @@ class Store:
         )
         parameters: list[Any] = [project_id]
         if classification is not None:
-            query += " AND r.classification=?"
-            parameters.append(classification)
+            classes = (classification,) if isinstance(classification, str) else tuple(classification)
+            if not classes:
+                return []
+            query += " AND r.classification IN (" + ",".join("?" for _ in classes) + ")"
+            parameters.extend(classes)
         query += " ORDER BY t.id"
         with self.connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
@@ -428,6 +444,55 @@ class Store:
             }
             for row in rows
         ]
+
+    def task_summaries(self, status: str | None, *, project_id: int | None = None,
+                       limit: int = 500) -> tuple[int, list[dict[str, Any]]]:
+        """Bounded task browser for dashboard counters, without loading huge queues."""
+        if status not in {None, "pending", "running", "done", "failed", "manual_review", "cancelled"}:
+            raise ValueError("Geçersiz görev durumu.")
+        where = []
+        parameters: list[Any] = []
+        if status is not None:
+            where.append("t.status=?")
+            parameters.append(status)
+        if project_id is not None:
+            where.append("t.project_id=?")
+            parameters.append(project_id)
+        condition = " WHERE " + " AND ".join(where) if where else ""
+        with self.connect() as connection:
+            total = connection.execute("SELECT COUNT(*) FROM tasks t" + condition, parameters).fetchone()[0]
+            rows = connection.execute(
+                "SELECT t.id,t.task_key,t.payload,p.name project_name FROM tasks t "
+                "JOIN projects p ON p.id=t.project_id" + condition + " ORDER BY t.id DESC LIMIT ?",
+                (*parameters, max(1, min(limit, 5000))),
+            ).fetchall()
+        return total, [{"task_id": row["id"], "task_key": row["task_key"],
+                        "project": row["project_name"], "payload": json.loads(row["payload"])}
+                       for row in rows]
+
+    def iter_task_records(self, project_id: int, *, connection: sqlite3.Connection | None = None):
+        """Stream every planned task, including failures without a result row."""
+        query = (
+            "SELECT t.id,t.task_key,t.payload,t.status,t.attempts,t.started_at,t.finished_at,"
+            "r.metrics,r.classification,r.verified,e.evidence,"
+            "(SELECT message FROM event_log WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1) last_event "
+            "FROM tasks t LEFT JOIN results r ON r.task_id=t.id "
+            "LEFT JOIN verification_evidence e ON e.task_id=t.id "
+            "WHERE t.project_id=? ORDER BY t.id"
+        )
+        with (nullcontext(connection) if connection is not None else self.connect()) as active_connection:
+            for row in active_connection.execute(query, (project_id,)):
+                payload = json.loads(row["payload"])
+                yield {
+                    "task_id": int(row["id"]), "task_key": row["task_key"],
+                    "payload": payload, "status": row["status"], "attempts": row["attempts"],
+                    "started_at": row["started_at"], "finished_at": row["finished_at"],
+                    "metrics": json.loads(row["metrics"]) if row["metrics"] else {},
+                    "classification": row["classification"] or "sonuç yok",
+                    "verified": bool(row["verified"]) if row["verified"] is not None else False,
+                    "evidence": json.loads(row["evidence"]) if row["evidence"] else {},
+                    "error": payload.get("last_error") or row["last_event"] or "",
+                }
 
     def enqueue_validation(self, parent_task_id: int, stage: str,
                            task_key: str, payload: dict[str, Any]) -> bool:
@@ -511,6 +576,7 @@ class Store:
                 "SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) done_count,"
                 "SUM(CASE WHEN t.status='pending' THEN 1 ELSE 0 END) pending_count,"
                 "SUM(CASE WHEN t.status='running' THEN 1 ELSE 0 END) running_count,"
+                "SUM(CASE WHEN t.status='cancelled' THEN 1 ELSE 0 END) cancelled_count,"
                 "SUM(CASE WHEN t.status IN ('failed','manual_review') THEN 1 ELSE 0 END) issue_count "
                 "FROM projects p LEFT JOIN tasks t ON t.project_id=p.id "
                 "GROUP BY p.id ORDER BY p.priority DESC,p.updated_at DESC"
@@ -603,6 +669,32 @@ class Store:
             rows = connection.execute(query, parameters).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
+    def research_provider_status(self, project_id: int) -> dict[str, list[dict[str, Any]]]:
+        """Keep historical research evidence separate from new local provider tasks."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT t.id,t.status,t.payload,r.classification,r.verified "
+                "FROM tasks t LEFT JOIN results r ON r.task_id=t.id "
+                "WHERE t.project_id=? ORDER BY t.id", (project_id,),
+            ).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            payload = json.loads(row["payload"])
+            source_id = payload.get("research_source_id")
+            if not source_id or payload.get("validation_stage") != "provider_check":
+                continue
+            if row["status"] == "done" and row["verified"]:
+                outcome = "passed" if row["classification"] not in ("elenmiş", "geçersiz") else "failed_threshold"
+            elif row["status"] in ("failed", "manual_review", "cancelled"):
+                outcome = "invalid"
+            else:
+                outcome = row["status"]
+            grouped.setdefault(source_id, []).append({
+                "task_id": int(row["id"]), "symbol": payload["symbol"],
+                "status": outcome, "classification": row["classification"],
+            })
+        return grouped
+
     def dashboard_stats(self, project_id: int | None = None) -> dict[str, Any]:
         where = " WHERE project_id=?" if project_id is not None else ""
         parameters: tuple[Any, ...] = (project_id,) if project_id is not None else ()
@@ -624,7 +716,8 @@ class Store:
         count_map = {str(row["status"]): int(row["count"]) for row in counts}
         done = int(completed["count"] or 0)
         span = max(0.0, float(completed["last"] or 0) - float(completed["first"] or 0))
-        tests_per_hour = done * 3600 / span if done > 0 and span > 0 else 0.0
+        # A few near-instant offline runs are not a meaningful throughput/ETA sample.
+        tests_per_hour = done * 3600 / span if done >= 5 and span >= 60 else 0.0
         remaining = count_map.get("pending", 0) + count_map.get("running", 0)
         eta_seconds = remaining * 3600 / tests_per_hour if tests_per_hour > 0 else None
         return {

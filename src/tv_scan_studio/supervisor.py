@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from .storage import Store
@@ -32,10 +33,16 @@ class WorkerState:
 
 
 class WorkerSupervisor:
-    def __init__(self, store: Store, driver: TradingViewDriver, heartbeat_seconds: float = 5):
+    def __init__(self, store: Store, driver: TradingViewDriver, heartbeat_seconds: float = 5,
+                 target_guard: Callable[[str], None] | None = None,
+                 download_directory: Path | None = None):
         self.store = store
         self.driver = driver
         self.heartbeat_seconds = heartbeat_seconds
+        self.target_guard = target_guard
+        self.download_directory = download_directory
+        if hasattr(driver, "target_guard"):
+            driver.target_guard = target_guard
         self.states: dict[int, WorkerState] = {}
         self._threads: list[threading.Thread] = []
         self._threads_by_worker: dict[int, threading.Thread] = {}
@@ -96,7 +103,8 @@ class WorkerSupervisor:
     def _loop(self, assignment: WorkerAssignment, stop_when_idle: bool) -> None:
         worker = ScanWorker(
             assignment.worker_id, assignment.target_id, self.store, self.driver,
-            list(assignment.project_ids), assignment.study_id,
+            list(assignment.project_ids), assignment.study_id, self.target_guard,
+            self.download_directory,
         )
         state = self.states[assignment.worker_id]
         try:

@@ -9,7 +9,10 @@ from typing import Any
 
 STRATEGY_RE = re.compile(r"(?m)^\s*strategy\s*\(")
 INPUT_START_RE = re.compile(
-    r"(?m)^\s*(?P<variable>[A-Za-z_]\w*)\s*=\s*input(?:\.(?P<kind>[A-Za-z_]\w*))?\s*\("
+    r"(?m)^[ \t]*(?:(?:var|varip|const)[ \t]+)?"
+    r"(?:(?:bool|int|float|string|color|timeframe|session)[ \t]+)?"
+    r"(?P<variable>[A-Za-z_]\w*)[ \t]*=[ \t]*"
+    r"input(?:\.(?P<kind>[A-Za-z_]\w*))?[ \t]*\("
 )
 SUPPORTED_KINDS = {"bool", "int", "float", "string", "timeframe", "session"}
 UNRESOLVED = object()
@@ -45,6 +48,7 @@ class PineInput:
     group: str | None = None
     tooltip: str | None = None
     manual_definition_required: bool = False
+    metadata_warnings: tuple[str, ...] = ()
 
 def _literal(value: str) -> Any:
     value = value.strip()
@@ -100,6 +104,20 @@ def _named_argument(argument: str) -> tuple[str | None, str]:
 def parse_strategy_inputs(source: str) -> list[PineInput]:
     if not STRATEGY_RE.search(source):
         raise ValueError("Yalnızca strategy() içeren Pine kodları desteklenir.")
+    # Resolve only direct string constants used by display metadata. Do not
+    # evaluate Pine expressions or infer a dynamic trading input's default.
+    constants = {}
+    for constant in re.finditer(
+        r'(?m)^\s*(?:(?:var|const)\s+)?(?:string\s+)?([A-Za-z_]\w*)\s*=\s*("(?:[^"\\]|\\.)*")\s*$',
+        source,
+    ):
+        value = _literal(constant.group(2))
+        if isinstance(value, str):
+            constants[constant.group(1)] = value
+
+    def metadata_literal(token: str) -> Any:
+        return constants[token.strip()] if token.strip() in constants else _literal(token)
+
     inputs: list[PineInput] = []
     for match in INPUT_START_RE.finditer(source):
         kind = match.group("kind") or "input"
@@ -114,16 +132,18 @@ def parse_strategy_inputs(source: str) -> list[PineInput]:
             (positional.append(value) if name is None else named.__setitem__(name, value))
         default = _literal(named.get("defval", positional[0] if positional else ""))
         title_token = named.get("title", positional[1] if len(positional) > 1 else "")
-        title = _literal(title_token) if title_token else match.group("variable")
+        title = metadata_literal(title_token) if title_token else match.group("variable")
         options = _literal(named["options"]) if "options" in named else None
         minimum = _literal(named["minval"]) if "minval" in named else None
         maximum = _literal(named["maxval"]) if "maxval" in named else None
         step = _literal(named["step"]) if "step" in named else None
-        group = _literal(named["group"]) if "group" in named else None
-        tooltip = _literal(named["tooltip"]) if "tooltip" in named else None
-        manual = kind not in SUPPORTED_KINDS or any(
-            value is UNRESOLVED for value in (default, title, options, minimum, maximum, step, group, tooltip)
-        )
+        group = metadata_literal(named["group"]) if "group" in named else None
+        tooltip = metadata_literal(named["tooltip"]) if "tooltip" in named else None
+        metadata = {"başlık": title, "seçenekler": options, "minimum": minimum,
+                    "maksimum": maximum, "adım": step, "grup": group, "açıklama": tooltip}
+        warnings = tuple(name for name, value in metadata.items() if value is UNRESOLVED)
+        # Display-only metadata must not make an otherwise known default unusable.
+        manual = kind not in SUPPORTED_KINDS or default is UNRESOLVED
         inputs.append(PineInput(
             variable=match.group("variable"), kind=kind,
             default=None if default is UNRESOLVED else default,
@@ -135,5 +155,6 @@ def parse_strategy_inputs(source: str) -> list[PineInput]:
             group=group if isinstance(group, str) else None,
             tooltip=tooltip if isinstance(tooltip, str) else None,
             manual_definition_required=manual,
+            metadata_warnings=warnings,
         ))
     return inputs

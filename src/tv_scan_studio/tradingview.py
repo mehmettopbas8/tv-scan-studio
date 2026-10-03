@@ -7,14 +7,30 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class TradingViewError(RuntimeError):
     pass
+
+
+def chart_resolution(timeframe: str) -> str:
+    """Convert user-friendly minute/hour labels to TradingView chart resolutions.
+
+    TradingView treats ``1M`` as one month, so ``1m`` must become ``1``.
+    """
+    value = str(timeframe).strip()
+    minute = re.fullmatch(r"(\d+)m", value)
+    if minute:
+        return str(int(minute.group(1)))
+    hour = re.fullmatch(r"(\d+)[hH]", value)
+    if hour:
+        return str(int(hour.group(1)) * 60)
+    return {"1D": "D", "1W": "W"}.get(value, value)
 
 
 class VerificationMismatch(TradingViewError):
@@ -32,6 +48,24 @@ class StrategySnapshot:
     metrics: dict[str, Any] | None
     period: dict[str, Any] | None
     trades: tuple[dict[str, Any], ...] = ()
+    report_source: str = "chart"
+
+
+@dataclass(frozen=True, slots=True)
+class DeepReportUiState:
+    date_label: str
+    metrics: dict[str, float | int]
+    update_pending: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyPropertiesUiState:
+    initial_capital: float
+    position_size: float
+    order_size_type: str
+    commission_value: float
+    commission_type: str
+    slippage_ticks: int
 
 
 class TradingViewDriver(Protocol):
@@ -43,7 +77,11 @@ class TradingViewDriver(Protocol):
 class GncZihinDriver:
     """Thin, target-explicit wrapper; importing it never starts TradingView."""
 
+    date_range_ready = True
+    deep_capture_ready = True
+
     def __init__(self, motor_path: str | Path | None = None):
+        self.target_guard: Callable[[str], None] | None = None
         if motor_path is None or not str(motor_path).strip():
             from . import motor_bridge
             self._motor = motor_bridge
@@ -59,14 +97,184 @@ class GncZihinDriver:
     def targets(self) -> list[str]:
         return list(self._motor.bul_hedefler())
 
+    def layout_name(self, target_id: str) -> str:
+        """Read the active TradingView layout label without changing the chart."""
+        label = self._motor._eval(target_id, r'''(()=>[...document.querySelectorAll('[aria-label]')]
+          .map(x=>x.getAttribute('aria-label')||'')
+          .find(x=>x.includes('Active layout:'))||'')()''')
+        if not isinstance(label, str) or "Active layout:" not in label:
+            return ""
+        return label.split("Active layout:", 1)[1].strip().splitlines()[0]
+
+    def replay_active(self, target_id: str) -> bool:
+        """Read-only Replay preflight; unknown UI state must not permit chart mutation."""
+        state = self._motor._eval(target_id, r"""(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          if([...document.querySelectorAll('[data-name="replay-bottom-toolbar"],'+
+              '[title="Exit Bar Replay"],[title="Replay mode"]')].some(visible))return true;
+          if([...document.querySelectorAll('button[aria-label="Bar replay"]')]
+              .some(visible))return false;
+          return null;
+        })()""")
+        if not isinstance(state, bool):
+            raise TradingViewError("TradingView Replay durumu okunamadı; worker korunuyor.")
+        return state
+
+    def chart_timezone(self, target_id: str) -> str:
+        """Read the chart timezone ID through TradingView's chart timezone API."""
+        value = self._motor._eval(target_id, r"""(()=>{
+          const c=TradingViewApi._activeChartWidgetWV.value();
+          return c?.getTimezoneApi?.().getTimezone?.().id||null;
+        })()""")
+        if not isinstance(value, str) or not value.strip():
+            raise TradingViewError("TradingView chart saat dilimi okunamadı.")
+        return value
+
+    def deep_report_ui_state(self, target_id: str) -> DeepReportUiState:
+        """Read only the visible Deep key stats, never the chart strategy report."""
+        data = self._motor._eval(target_id, r"""(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          const dateButtons=[...document.querySelectorAll('button[aria-label]')]
+            .filter(e=>visible(e)&&/\d{4}.+\d{4}/.test(e.getAttribute('aria-label')||''));
+          const titles=[...document.querySelectorAll('*')].filter(e=>visible(e)&&
+            e.children.length===0&&(e.textContent||'').trim()==='Key stats'&&
+            !e.closest('[data-name="widgetbar-pages-with-tabs"]'));
+          if(dateButtons.length!==1||titles.length!==1)return {error:'deep_report_not_unique'};
+          const area=titles[0].parentElement;
+          const stat=label=>{
+            const matches=[...area.querySelectorAll('*')].filter(e=>e.children.length===0&&
+              (e.textContent||'').trim()===label);
+            const values=matches.map(e=>(e.parentElement?.parentElement?.textContent||'').trim());
+            return values.length>0&&values.every(value=>value===values[0])?values[0]:null;
+          };
+          const pending=[...document.querySelectorAll('button')].some(e=>visible(e)&&
+            /Update report/i.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')));
+          return {dateLabel:dateButtons[0].getAttribute('aria-label'),
+            deep:/deep\s*$/i.test((dateButtons[0].textContent||'').trim()),pending,
+            totalPnl:stat('Total PnL'),maxDrawdown:stat('Max drawdown'),
+            profitableTrades:stat('Profitable trades'),profitFactor:stat('Profit factor')};
+        })()""")
+        if not isinstance(data, dict) or data.get("error") or not data.get("deep"):
+            raise TradingViewError("Deep Strategy Report görünür ve benzersiz değil.")
+        if type(data.get("pending")) is not bool or not isinstance(data.get("dateLabel"), str):
+            raise TradingViewError("Deep Strategy Report güncelleme/tarih durumu okunamadı.")
+        raw = [data.get(key) for key in ("totalPnl", "maxDrawdown", "profitableTrades", "profitFactor")]
+        if not all(isinstance(value, str) and value for value in raw):
+            raise TradingViewError("Deep Strategy Report temel metrikleri okunamadı.")
+        def number(value: str) -> float:
+            match = re.search(r"[-+−]?\d[\d,]*(?:\.\d+)?", value)
+            if not match:
+                raise TradingViewError("Deep Strategy Report sayı biçimi okunamadı.")
+            return float(match.group().replace("−", "-").replace(",", ""))
+        total = re.search(r"(\d+)\s*/\s*(\d+)", raw[2])
+        percentages = [re.findall(r"[-+−]?\d[\d,]*(?:\.\d+)?(?=\s*%)", value)
+                       for value in (raw[1], raw[2])]
+        if not total or not all(percentages):
+            raise TradingViewError("Deep Strategy Report işlem/DD biçimi okunamadı.")
+        metrics = {"net_profit": number(raw[0]), "max_drawdown_pct": number(percentages[0][0]),
+                   "win_rate_pct": number(percentages[1][0]), "trades": int(total.group(2)),
+                   "profit_factor": number(raw[3].split("Profit factor", 1)[-1])}
+        return DeepReportUiState(data["dateLabel"], metrics, data["pending"])
+
+    def strategy_properties_ui_state(self, target_id: str) -> StrategyPropertiesUiState:
+        """Read visible Strategy Properties without changing or saving any value."""
+        if self.target_guard is None:
+            raise TradingViewError("Strategy Properties okuması için worker koruması gerekli.")
+        self.target_guard(target_id)
+        opened = self._motor._eval(target_id, r"""(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          if([...document.querySelectorAll('[data-name="indicator-properties-dialog"][role="dialog"]')]
+              .some(visible))return {error:'properties_dialog_already_open'};
+          const dates=[...document.querySelectorAll('button[aria-label]')].filter(e=>visible(e)&&
+            /\d{4}.+\d{4}/.test(e.getAttribute('aria-label')||''));
+          if(dates.length!==1)return {error:'strategy_report_not_unique'};
+          const settings=[...document.querySelectorAll('button[aria-label="Settings"]')].filter(e=>visible(e)&&
+            Math.abs(e.getBoundingClientRect().y-dates[0].getBoundingClientRect().y)<8);
+          if(settings.length!==1)return {error:'report_settings_not_unique'};
+          settings[0].click();return true;
+        })()""")
+        if opened is not True:
+            raise TradingViewError(f"Strategy Properties açılamadı: {opened!r}")
+        try:
+            time.sleep(0.15)
+            self.target_guard(target_id)
+            data = self._motor._eval(target_id, r"""(()=>{
+              const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+              const dialogs=[...document.querySelectorAll('[data-name="indicator-properties-dialog"][role="dialog"]')]
+                .filter(visible);
+              if(dialogs.length!==1)return {error:'properties_dialog_not_unique'};
+              const dialog=dialogs[0];
+              const tabs=[...dialog.querySelectorAll('[role="tab"]')].filter(e=>visible(e)&&
+                (e.textContent||'').trim()==='Properties'&&e.className.includes('selected'));
+              if(tabs.length!==1)return {error:'properties_tab_not_selected'};
+              const one=selector=>{const nodes=[...dialog.querySelectorAll(selector)].filter(visible);
+                return nodes.length===1?nodes[0]:null;};
+              const capital=one('[data-qa-id="ui-lib-Input-input initial-capital-input"]');
+              const size=one('[data-qa-id="ui-lib-Input-input order-size-input"]');
+              const sizeType=one('[data-qa-id="order-size-type-input"]');
+              const commission=one('[data-qa-id="ui-lib-Input-input commission-input"]');
+              const commissionType=one('[data-qa-id="commission-type-input"]');
+              const slippage=one('[data-qa-id="ui-lib-Input-input slippage-input"]');
+              if([capital,size,sizeType,commission,commissionType,slippage].some(x=>!x))
+                return {error:'properties_fields_not_unique'};
+              return {capital:capital.value,size:size.value,
+                sizeType:(sizeType.textContent||'').trim(),commission:commission.value,
+                commissionType:(commissionType.textContent||'').trim(),slippage:slippage.value};
+            })()""")
+        finally:
+            self.target_guard(target_id)
+            closed = self._motor._eval(target_id, r"""(()=>{
+              const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+              const dialogs=[...document.querySelectorAll('[data-name="indicator-properties-dialog"][role="dialog"]')]
+                .filter(visible);
+              if(dialogs.length!==1)return {error:'properties_dialog_cannot_close'};
+              const close=[...dialogs[0].querySelectorAll('button[data-qa-id="close"]')].filter(visible);
+              if(close.length!==1)return {error:'properties_close_not_unique'};
+              close[0].click();return true;
+            })()""")
+            if closed is not True:
+                raise TradingViewError("Strategy Properties kaydetmeden kapatılamadı.")
+        if not isinstance(data, dict) or data.get("error"):
+            raise TradingViewError(f"Strategy Properties okunamadı: {data!r}")
+        def scalar(key: str) -> float:
+            raw = data.get(key)
+            if not isinstance(raw, str) or not re.fullmatch(r"\d[\d,]*(?:\.\d+)?", raw):
+                raise TradingViewError(f"Strategy Properties sayı biçimi okunamadı: {key}")
+            return float(raw.replace(",", ""))
+        slip = scalar("slippage")
+        if not slip.is_integer():
+            raise TradingViewError("Strategy Properties slippage tick değeri tam sayı değil.")
+        if data.get("sizeType") != "Quantity" or data.get("commissionType") not in {
+            "Percent", "Cash per contract", "Cash per order", "Per contract", "Per order"
+        }:
+            raise TradingViewError(
+                "Strategy Properties emir/komisyon türü bilinmiyor: "
+                f"{data.get('sizeType')!r}, {data.get('commissionType')!r}"
+            )
+        return StrategyPropertiesUiState(
+            initial_capital=scalar("capital"), position_size=scalar("size"),
+            order_size_type="contracts", commission_value=scalar("commission"),
+            commission_type={"Percent": "percent", "Cash per contract": "cash_per_contract",
+                             "Cash per order": "cash_per_order",
+                             "Per contract": "cash_per_contract",
+                             "Per order": "cash_per_order"}[data["commissionType"]],
+            slippage_ticks=int(slip),
+        )
+
     def strategies(self, target_id: str) -> list[dict[str, Any]]:
         result = self._motor._eval(target_id, r"""(()=>{
           const c=TradingViewApi._activeChartWidgetWV.value();
           return c._chartWidget.model().dataSources()
             .filter(x=>typeof x.reportData==='function')
             .map(x=>{const iv=c.getStudyById(x.id())?.getInputValues?.()||[];
+              const definitions=x.metaInfo?.()?.inputs||[];
+              const scriptIds=definitions.filter(v=>/^in_\d+$/.test(v.id)&&v.groupId!=='strategy_props').map(v=>v.id);
+              const scriptSet=new Set(scriptIds);
+              const propertyIds=iv.map(v=>v.id).filter(id=>/^in_\d+$/.test(id)&&!scriptSet.has(id));
               return {id:x.id?.(),name:x.name?.(),status:x._status?.value?.(),
-                input_ids:iv.map(v=>v.id).filter(id=>/^in_\d+$/.test(id)),
+                input_ids:scriptIds,property_input_ids:propertyIds,
+                pine_digest:x.metaInfo?.()?.pine?.digest||null,
+                pine_version:x.metaInfo?.()?.pine?.version||null,
                 pine_id:iv.find(v=>v.id==='pineId')?.value||null};});
         })()""")
         return result if isinstance(result, list) else []
@@ -92,14 +300,18 @@ class GncZihinDriver:
         )
         result = self._motor._eval(target_id, "(()=>{" + prefix + body + "})()")
         if isinstance(result, dict) and result.get("error"):
-            raise TradingViewError(f"Strateji bulunamadı: {study_id}")
+            if result["error"] == "study_missing":
+                raise TradingViewError(f"Strateji bulunamadı: {study_id}")
+            raise TradingViewError(f"TradingView arayüzü: {result['error']}")
         return result
 
     def snapshot(self, target_id: str, study_id: str) -> StrategySnapshot:
-        data = self._eval(target_id, study_id, """
+        data = self._eval(target_id, study_id, r"""
             const r=s.reportData(),p=r?.performance,a=p?.all;
+            const scriptIds=new Set((s.metaInfo?.()?.inputs||[])
+              .filter(v=>/^in_\d+$/.test(v.id)&&v.groupId!=='strategy_props').map(v=>v.id));
             return {status:s._status?.value?.(),symbol:c.symbol(),tf:String(c.resolution()),
-              inputs:c.getStudyById(s.id()).getInputValues(),
+              inputs:c.getStudyById(s.id()).getInputValues().filter(v=>scriptIds.has(v.id)),
               metrics:a?{trades:a.totalTrades,profit_factor:a.profitFactor,
                 win_rate_pct:a.percentProfitable*100,max_drawdown_pct:p.maxStrategyDrawDownPercent*100,
                 net_profit:a.netProfit,net_profit_pct:a.netProfitPercent*100}:null,
@@ -113,15 +325,217 @@ class GncZihinDriver:
                     if re.fullmatch(r"in_\d+", str(item.get("id", "")))},
             metrics=data.get("metrics"), period=data.get("period"),
             trades=tuple(data.get("trades") or ()),
+            report_source="chart",
         )
 
     def configure(self, target_id: str, study_id: str, symbol: str, timeframe: str, inputs: dict[str, Any]) -> None:
         values = [{"id": key, "value": value} for key, value in inputs.items()]
+        if self.target_guard is not None:
+            self.target_guard(target_id)
         self._eval(target_id, study_id, f"c.setSymbol({json.dumps(symbol)},{{}});return true;")
         time.sleep(1.2)
-        self._eval(target_id, study_id, f"c.setResolution({json.dumps(timeframe)},{{}});return true;")
+        if self.target_guard is not None:
+            self.target_guard(target_id)
+        self._eval(target_id, study_id, f"c.setResolution({json.dumps(chart_resolution(timeframe))},{{}});return true;")
         time.sleep(0.8)
+        if self.target_guard is not None:
+            self.target_guard(target_id)
         self._eval(target_id, study_id, f"c.getStudyById(s.id()).setInputValues({json.dumps(values)});return true;")
+
+    def configure_strategy_properties(self, target_id: str, study_id: str,
+                                      assumptions: dict[str, Any]) -> None:
+        """Apply only dynamically identified cost fields on an isolated worker."""
+        from .cost_application import strategy_property_values
+        if self.target_guard is None:
+            raise TradingViewError("Maliyet ayarı için worker koruması gerekli.")
+        self.target_guard(target_id)
+        definitions = self._eval(target_id, study_id, "return s.metaInfo().inputs;")
+        if not isinstance(definitions, list):
+            raise TradingViewError("Strategy Properties tanımları okunamadı.")
+        values = strategy_property_values(definitions, assumptions)
+        self.target_guard(target_id)
+        result = self._eval(target_id, study_id,
+            f"c.getStudyById(s.id()).setInputValues({json.dumps(values)});return true;")
+        if result is not True:
+            raise TradingViewError("Strategy Properties uygulaması onaylanmadı.")
+        self.target_guard(target_id)
+        observed = self._eval(target_id, study_id,
+            "return c.getStudyById(s.id()).getInputValues();")
+        if not isinstance(observed, list) or any(
+            not any(item.get("id") == v["id"] and not isinstance(item.get("value"), bool)
+                    and item.get("value") == v["value"] for item in observed) for v in values):
+            raise TradingViewError("Strategy Properties değerleri uygulanmadı.")
+
+    def configure_date_range(self, target_id: str, study_id: str,
+                             requested: dict[str, Any]) -> None:
+        """Apply Strategy Report dates only on a guarded worker target.
+
+        Live two-worker date/input/timeframe/cost tests cover this adapter. Every
+        task still requires a fresh exported report and independent verification.
+        """
+        if not hasattr(self, "_configured_report_dates"):
+            self._configured_report_dates = {}
+        self._configured_report_dates.pop(target_id, None)
+        start, end = requested.get("from"), requested.get("to")
+        try:
+            start_date, end_date = date.fromisoformat(start), date.fromisoformat(end)
+        except (TypeError, ValueError) as exc:
+            raise TradingViewError("Geçersiz TradingView tarih aralığı.") from exc
+        if start_date.isoformat() != start or end_date.isoformat() != end or start_date > end_date:
+            raise TradingViewError("Geçersiz TradingView tarih aralığı.")
+        if self.target_guard is None:
+            raise TradingViewError("Tarih ayarı için benzersiz worker layout koruması gerekli.")
+        insert_text = getattr(self._motor, "insert_text", None)
+        if not callable(insert_text):
+            raise TradingViewError("Gerçek CDP tarih metin girişi sürücüde bulunamadı.")
+
+        def step(body: str, expected: Any = True) -> None:
+            self.target_guard(target_id)
+            observed = self._eval(target_id, study_id, body)
+            if type(observed) is not type(expected) or observed != expected:
+                raise TradingViewError("TradingView tarih arayüzü beklenen adımı onaylamadı.")
+
+        step(r"""
+            const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+            const triggers=[...document.querySelectorAll('button[aria-label]')]
+              .filter(e=>visible(e)&&/\d{4}.+\d{4}/.test(e.getAttribute('aria-label')||''));
+            if(triggers.length!==1)return {error:'strategy_report_date_trigger_missing'};
+            triggers[0].click();return true;
+        """)
+        time.sleep(0.2)
+        step(r"""
+            const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+            const menus=[...document.querySelectorAll('[role="menu"]')]
+              .filter(e=>visible(e)&&e.textContent?.includes('Testing period'));
+            if(menus.length!==1)return {error:'testing_period_menu_missing'};
+            const leaves=[...menus[0].querySelectorAll('*')]
+              .filter(e=>e.children.length===0&&e.textContent?.trim()==='Custom date range');
+            if(leaves.length!==1)return {error:'custom_date_range_action_missing'};
+            leaves[0].click();return true;
+        """)
+        time.sleep(0.2)
+        for index, value in enumerate((start, end)):
+            step(f"""
+                const dialog=document.querySelector('[data-name="custom-date-range-dialog"][role="dialog"]');
+                const fields=dialog?.querySelectorAll('input[placeholder="YYYY-MM-DD"]');
+                if(!fields||fields.length!==2)return {{error:'date_dialog_fields_missing'}};
+                const field=fields[{index}];field.focus();field.select();
+                return document.activeElement===field;
+            """)
+            self.target_guard(target_id)
+            insert_text(target_id, value)
+            step(f"""
+                const dialog=document.querySelector('[data-name="custom-date-range-dialog"][role="dialog"]');
+                const fields=dialog?.querySelectorAll('input[placeholder="YYYY-MM-DD"]');
+                if(!fields||fields.length!==2)return {{error:'date_dialog_fields_missing'}};
+                fields[{index}].blur();return fields[{index}].value;
+            """, value)
+            time.sleep(0.2)
+        step(f"""
+            const dialog=document.querySelector('[data-name="custom-date-range-dialog"][role="dialog"]');
+            const fields=dialog?.querySelectorAll('input[placeholder="YYYY-MM-DD"]');
+            if(!fields||fields.length!==2||fields[0].value!=={json.dumps(start)}||
+               fields[1].value!=={json.dumps(end)})return {{error:'date_values_not_retained'}};
+            const submit=dialog.querySelector('button[data-name="submit-button"]');
+            if(!submit||submit.disabled)return {{error:'date_submit_unavailable'}};
+            submit.click();return true;
+        """)
+        self._configured_report_dates[target_id] = (start_date, end_date)
+
+    def refresh_deep_report(self, target_id: str) -> bool:
+        """Refresh pending reports, or observe an explicitly requested automatic report.
+
+        An idle report is allowed only after this driver successfully submitted the
+        dates. This is a readiness check, not result verification: capture still
+        requires a fresh XLSX matching dates, metrics, properties and changed inputs.
+        """
+        if self.target_guard is None:
+            raise TradingViewError("Deep güncelleme için worker koruması gerekli.")
+        requested = getattr(self, "_configured_report_dates", {}).pop(target_id, None)
+        before = None
+        for _ in range(10):
+            self.target_guard(target_id)
+            before = self.deep_report_ui_state(target_id)
+            if before.update_pending:
+                break
+            time.sleep(0.5)
+        if not before.update_pending:
+            try:
+                observed_dates = tuple(datetime.strptime(part.strip(), "%b %d, %Y").date()
+                                       for part in before.date_label.split(" — "))
+            except ValueError:
+                observed_dates = ()
+            if requested is None or observed_dates != requested:
+                raise TradingViewError("Yeni görev için Update report beklemiyor; tazelik kanıtlanamaz.")
+            for _ in range(3):
+                self.target_guard(target_id)
+                after = self.deep_report_ui_state(target_id)
+                if after != before or after.update_pending:
+                    raise TradingViewError("Otomatik Deep rapor henüz kararlı değil.")
+                time.sleep(0.5)
+            return True
+        self.target_guard(target_id)
+        clicked = self._motor._eval(target_id, r"""(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          const buttons=[...document.querySelectorAll('button')].filter(e=>visible(e)&&
+            /Update report/i.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')));
+          if(buttons.length!==1||buttons[0].disabled)return {error:'update_report_not_unique'};
+          buttons[0].click();return true;
+        })()""")
+        if clicked is not True:
+            raise TradingViewError("Update report düğmesi onaylanmadı.")
+        deadline = time.monotonic() + 75
+        stable = 0
+        while time.monotonic() < deadline:
+            self.target_guard(target_id)
+            try:
+                after = self.deep_report_ui_state(target_id)
+            except TradingViewError:
+                stable = 0
+                time.sleep(0.5)
+                continue
+            if not after.update_pending and after.date_label == before.date_label:
+                stable += 1
+                if stable >= 3:
+                    return True
+            else:
+                stable = 0
+            time.sleep(0.5)
+        raise TradingViewError("Deep güncelleme zamanında tamamlanmadı.")
+
+    def download_deep_xlsx(self, target_id: str) -> bool:
+        """Use the visible report-tab export menu; file identity is checked by controller."""
+        if self.target_guard is None:
+            raise TradingViewError("Deep indirme için worker koruması gerekli.")
+        self.target_guard(target_id)
+        state = self.deep_report_ui_state(target_id)
+        if state.update_pending:
+            raise TradingViewError("Güncellemesi bekleyen Deep rapor indirilemez.")
+        self.target_guard(target_id)
+        opened = self._motor._eval(target_id, r"""(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          const menus=[...document.querySelectorAll('button[title="Open context menu"]')]
+            .filter(visible);
+          if(menus.length<1||menus.length>2)return {error:'report_menu_not_unique'};
+          const first=menus[0].getBoundingClientRect();
+          if(menus.some(e=>{const r=e.getBoundingClientRect();return Math.abs(r.x-first.x)>1||
+            Math.abs(r.y-first.y)>1||Math.abs(r.width-first.width)>1||
+            Math.abs(r.height-first.height)>1;}))return {error:'report_menus_not_overlapping'};
+          menus[0].click();return true;
+        })()""")
+        if opened is not True:
+            raise TradingViewError("Deep dışa aktarım menüsü açılamadı.")
+        self.target_guard(target_id)
+        clicked = self._motor._eval(target_id, r"""(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          const items=[...document.querySelectorAll('[role="menuitem"][aria-label="Download data as XLSX"]')]
+            .filter(visible);
+          if(items.length!==1)return {error:'xlsx_action_not_unique'};
+          items[0].click();return true;
+        })()""")
+        if clicked is not True:
+            raise TradingViewError("Deep XLSX indirme eylemi onaylanmadı.")
+        return True
 
     def screenshot(self, target_id: str, destination: str | Path) -> str:
         path = Path(destination)
@@ -134,26 +548,67 @@ def strategy_structure_matches(strategy: dict[str, Any], expected_title: str,
                                expected_input_count: int) -> bool:
     expected_ids = {f"in_{index}" for index in range(expected_input_count)}
     observed_ids = set(strategy.get("input_ids") or ())
-    return str(strategy.get("name") or "").strip() == expected_title.strip() and observed_ids == expected_ids
+    return str(strategy.get("name") or "").strip() == expected_title.strip() and expected_ids <= observed_ids
+
+
+def confirmed_strategy_identity_matches(strategy: dict[str, Any], identity: dict[str, Any],
+                                        *, pine_hash: str, expected_title: str,
+                                        expected_input_count: int) -> bool:
+    """Require confirmed Pine identity, accepting a legacy list with TV strategy properties."""
+    observed = strategy.get("input_ids")
+    saved = identity.get("input_ids")
+    properties = strategy.get("property_input_ids") or []
+    saved_matches = observed == saved or bool(
+        isinstance(observed, list) and isinstance(saved, list)
+        and isinstance(properties, list) and properties
+        and saved == observed + properties
+    )
+    return bool(
+        strategy_structure_matches(strategy, expected_title, expected_input_count)
+        and isinstance(observed, list) and isinstance(saved, list) and saved
+        and all(isinstance(value, str) for value in observed)
+        and len(observed) == len(set(observed))
+        and saved_matches
+        and identity.get("pine_id")
+        and strategy.get("pine_id") == identity["pine_id"]
+        and identity.get("pine_hash") == pine_hash
+        and all(not identity.get(key) or strategy.get(key) == identity[key]
+                for key in ("pine_digest", "pine_version"))
+        and identity.get("user_source_confirmed") is True
+    )
 
 
 def symbol_matches(requested: str, observed: str) -> bool:
-    contract = requested.rsplit(":", 1)[-1]
-    return observed == requested or observed.endswith(":" + contract)
+    requested = requested.strip()
+    observed = observed.strip()
+    if ":" in requested:
+        return observed == requested
+    return observed == requested or observed.rsplit(":", 1)[-1] == requested
 
 
-def date_range_matches(expected: dict[str, Any], period: dict[str, Any] | None) -> bool:
+def date_range_matches(expected: dict[str, Any], period: dict[str, Any] | None,
+                       chart_timezone: str | None = None) -> bool:
     if not expected:
         return True
     backtest = ((period or {}).get("dateRange") or {}).get("backtest") or {}
+    for key in ("from", "to"):
+        exact = expected.get(f"{key}_ms")
+        if exact is not None and backtest.get(key) != exact:
+            return False
     for key in ("from", "to"):
         requested = expected.get(key)
         if not requested:
             continue
         observed = backtest.get(key)
-        if not isinstance(observed, (int, float)):
+        if (isinstance(observed, bool) or not isinstance(observed, (int, float))
+                or not isinstance(chart_timezone, str) or not chart_timezone):
             return False
-        observed_date = datetime.fromtimestamp(observed / 1000).date().isoformat()
+        try:
+            observed_date = datetime.fromtimestamp(
+                observed / 1000, ZoneInfo(chart_timezone),
+            ).date().isoformat()
+        except (ZoneInfoNotFoundError, OverflowError, OSError, ValueError):
+            return False
         if observed_date != requested:
             return False
     return True
@@ -177,15 +632,27 @@ def wait_for_verified_result(
     while time.monotonic() < deadline:
         last = driver.snapshot(target_id, study_id)
         state = json.dumps([last.metrics, last.period, len(last.trades), last.trades[-1] if last.trades else None], sort_keys=True)
-        requested_tf = {"1H": "60", "4H": "240", "1D": "D", "1W": "W"}.get(expected["timeframe"], expected["timeframe"])
-        period_matches = date_range_matches(expected.get("date_range") or {}, last.period)
+        requested_tf = chart_resolution(expected["timeframe"])
+        requested_dates = expected.get("date_range") or {}
+        zone_reader = getattr(driver, "chart_timezone", None)
+        try:
+            chart_zone = zone_reader(target_id) if requested_dates and callable(zone_reader) else None
+        except Exception:
+            chart_zone = None
+        period_matches = date_range_matches(requested_dates, last.period, chart_zone)
+        source_matches = not requested_dates or last.report_source == "deep_strategy_report"
         valid = (
             last.status_type == 2
             and last.metrics is not None
             and symbol_matches(expected["symbol"], last.symbol)
             and last.timeframe == requested_tf
-            and all(last.inputs.get(key) == value for key, value in expected.get("inputs", {}).items())
+            and all(
+                key in last.inputs and last.inputs[key] == value
+                and (isinstance(last.inputs[key], bool) == isinstance(value, bool))
+                for key, value in expected.get("inputs", {}).items()
+            )
             and period_matches
+            and source_matches
         )
         stable = stable + 1 if valid and state == previous else (1 if valid else 0)
         previous = state

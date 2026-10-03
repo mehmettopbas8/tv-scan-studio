@@ -1,4 +1,5 @@
 .venv/
+.venv*/
 .pytest_cache/
 .live-smoke-profile*/
 __pycache__/
@@ -11,3 +12,21 @@ dist-*/
 screenshots/
 tmp/
 output/
+output-local-*/
+src/tv_scan_studio/data/ftmo_session_20260923.json
+src/tv_scan_studio/data/ftmo_overnight_33075.jsonl.gz
+# Local acceptance evidence and live-account inspection helpers are not release source.
+docs/IMPLEMENTATION_STATUS.md
+docs/ALGOGRAPH_UI_AND_COMPLETION_PLAN.md
+docs/ORIGINAL_MVP_ACCEPTANCE_AUDIT.md
+tools/inspect_*.py
+tools/close_worker3_*.py
+tools/open_worker3_*.py
+tools/probe_worker3_*.py
+tools/submit_worker3_*.py
+tools/live_10am_*.py
+tools/live_date_*.py
+tools/live_parallel_*.py
+tools/live_two_worker_deep_*.py
+tools/live_two_worker_queued_*.py
+tools/live_worker3_*.py

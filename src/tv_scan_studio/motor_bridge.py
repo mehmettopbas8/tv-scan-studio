@@ -38,6 +38,21 @@ def _eval(target_id: str, expression: str, await_promise: bool = False, timeout:
     return result.get("result", {}).get("result", {}).get("value")
 
 
+def insert_text(target_id: str, value: str, timeout: int = 10) -> None:
+    """Send genuine CDP text input to the already-focused target field."""
+    websocket = create_connection(
+        f"ws://127.0.0.1:{CDP_PORT}/devtools/page/{target_id}",
+        timeout=timeout, suppress_origin=True,
+    )
+    try:
+        websocket.send(json.dumps({"id": 1, "method": "Input.insertText", "params": {"text": value}}))
+        result = json.loads(websocket.recv())
+    finally:
+        websocket.close()
+    if result.get("id") != 1 or result.get("error"):
+        raise RuntimeError(f"CDP metin girişi doğrulanmadı: {result.get('error') or result!r}")
+
+
 def screenshot(target_id: str, destination: str | Path) -> str:
     websocket = create_connection(
         f"ws://127.0.0.1:{CDP_PORT}/devtools/page/{target_id}",

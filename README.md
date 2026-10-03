@@ -8,22 +8,27 @@ TradingView Desktop üzerindeki Pine stratejilerinin input kombinasyonlarını y
 - Lazy kombinasyon üretimi ve önizleme sayısı
 - SQLite proje ve devam ettirilebilir görev kuyruğu
 - Atomik worker görev alma, üç denemeli hata yönetimi ve manuel inceleme
-- Yalnızca doğrulanmış görevler için sonuç kaydı ve CSV dışa aktarımı
+- Başarılı, elenmiş ve teknik hatalı görevlerin saklanması; tüm görevler için CSV/Excel dışa aktarımı
 - Çok satırlı Pine inputları ile options/min/max/step/group/tooltip ayrıştırma
 - PySide6 uygulama giriş noktası
 - Sembol, timeframe, tarih, input ve maliyet kanıtı doğrulanan CDP workerları
 - Target başına ayrı strategy ID ile iki veya daha fazla bağımsız worker
 - Dashboard, görev planlama, worker dağıtımı, sonuç/olay ekranı
-- Başarılı preset filtreleme, yan yana tablo karşılaştırması ve CSV
+- PF/DD/işlem/kanıt filtreleri, kayıtlı filtreler ve dönem-maliyet uyarılı karşılaştırma
 - Normal ve Microsoft Store TradingView Desktop keşfi
 - Tek CDP 9222 oturumu içinde güvenli chart tabı çoğaltma
 - Worker başına bağımsız proje atama, proje önceliği, pause/cancel/retry
 - CPU/RAM worker önerisi, 2/4/8/16 projeksiyonu, test/saat ve ETA
 - Sabit/liste/aralık/exclude input taraması ve FTMO sembol profilleri
+- Kaynakta tanımı dışında hiç kullanılmayan input başlangıçta otomatik dışlanır; kullanıcı tek seçimle geri alabilir. Aynı koşullarda en az üç doğrulanmış değerin aynı sonucu vermesi ise yalnız "etkisiz olabilir" uyarısı üretir, otomatik dışlama yapmaz.
 - Pozisyon, risk ve maliyet varsayımları; gerçek `in_N` eşlemesi ve özel şablonlar
 - Komşu değer, maliyet stresi ve alternatif sağlayıcı aşamalı doğrulaması
 - İşlem bazlı günlük P/L, FTMO kayıp, seri, süre, long/short, session ve yoğunlaşma analizi
-- Equity/drawdown grafiği, günlük P/L görünümü, PDF raporu ve doğrulanmış CSV
+- Yakınlaştırılabilir equity/drawdown, PF–DD dağılımı, günlük takvim, saat/gün/session grafikleri
+- Başarılı presetler için PDF/CSV/Excel; tüm görevler için yalnız CSV/Excel
+- Sonuç ekranındaki "ekranda görünen" dışa aktarma yalnız filtrelenmiş sonuç satırlarını içerir; teknik hataları da indirmek için "projedeki tüm uygun kayıtlar" seçilir. CSV/Excel şeması seçilen görevlerdeki bütün input alanlarını korur.
+- İsteğe bağlı yerel araştırma kataloğu ve tarihsel arşiv görünümü; özel araştırma verileri açık kaynak ve portable dağıtıma dahil değildir
+- Aynı ayar/dönemle alternatif sağlayıcı görevi hazırlama; ilişkili inputları birlikte tutan kontrollü varyantlar
 - Checksum doğrulamalı SQLite + Pine kaynak yedeği
 - Windows bildirimleri ve tamamen yerel ayarlar; telemetri/kullanıcı hesabı yok
 
@@ -46,7 +51,7 @@ python -m venv .venv
 ZIP ve SHA-256 checksum üretir. İlk sürüm imzasızdır; Windows SmartScreen
 uyarısında dosyanın GitHub Release checksum değeri doğrulanmalıdır.
 
-Portable paketin SQLite ve Türkçe PDF bağımlılıklarını GUI açmadan doğrulamak için:
+Portable paketin SQLite, Türkçe PDF ve zaman dilimi desteğini GUI açmadan doğrulamak için (özel araştırma arşivleri dağıtıma dahil değildir):
 
 ```powershell
 dist\TV-Scan-Studio\TV-Scan-Studio.exe --self-test
@@ -58,7 +63,7 @@ başlattığında devreye girer.
 
 Tarama kendiliğinden başlamaz. Kullanıcı önce Pine projesini ve görev planını
 kaydeder, Worker dağıtımı ekranında CDP targetlarını bulur ve ardından
-`Workerları başlat` düğmesine basar. Her worker farklı target kullanır. Uygulama
+`Taramayı başlat` düğmesine basar. Her çalışan farklı sekme kullanır. Uygulama
 kapanırsa yarım kalan görevler yeniden bekleme kuyruğuna alınır.
 
 Temel kriterleri geçen tek ölçüm `hassas` kabul edilir. `dayanıklı` sınıfı için
@@ -68,8 +73,24 @@ TradingView Desktop yalnızca `9222` portuyla açılır. Ek workerlar ikinci bir
 port veya ikinci hesap oturumu başlatmaz; uygulama aynı CDP profili içinde yeni
 chart tabları açar. Worker çalıştırmadan önce Pine başlığı ve input yapısı
 eşleşmeli, ilk kullanımda kullanıcı kalıcı `pine_id` ve yerel Pine SHA-256
-eşlemesini onaylamalıdır. Kaynak değişirse worker kilidi yeniden devreye girer;
+eşlemesini onaylamalıdır. Başlatma onayından sonra sekme ve kimlik yeniden salt
+okunur doğrulanır; kaydedilmiş kimlik veya input yapısı değişirse worker kilidi yeniden devreye girer;
 uygulama belirsiz bir grafiğe otomatik kod yapıştırmaz veya mevcut çalışmayı gizlemez.
+Grafikte çalışan Pine kaynak metni otomatik okunup hash'lenmez; yerel kaynak ile
+grafikteki sürümün aynı olduğuna dair kullanıcı onayı gerekir. Bu onay otomatik
+kaynak eşitliği kanıtı değildir.
+TradingView'in sekmeler arası layout/bulut eşitlemesinin mevcut grafikleri nasıl
+etkilediği canlı test edilmeden ayrıca doğrulanmış sayılmaz.
+
+Özel araştırma kataloğu ve tarihsel arşiv dağıtımda yoktur. Bu dosyalar yerel
+olarak sağlanmadığında araştırma ekranı veri eksikliğini açıklar ve ilgili
+eylemleri kapatır; yeni proje, input planlama ve tarama akışı kullanılabilir.
+Yerel araştırma verisi varsa dönem, maliyet ve sağlayıcı kapsamı ayrıca
+incelenmelidir; farklı dönemlerdeki sonuçlar doğrudan kıyaslanmamalıdır.
+Alternatif sağlayıcı görevi hazırlamak worker başlatmaz.
+FTMO gün içi equity ihlali kapalı işlem listesinden kanıtlanamaz; raporda bu
+sınır açıkça belirtilir. Kontrollü varyantlar, birlikte değişmesi gereken input
+gruplarını çapraz çarpım yerine eşlenmiş durumlar olarak çalıştırır.
 
 Lisans: AGPL-3.0-only.
 
@@ -77,9 +98,12 @@ Lisans: AGPL-3.0-only.
 
 ```powershell
 .venv\Scripts\python.exe tools\live_two_worker_smoke.py `
-  --target TARGET_1 --target TARGET_2 --study-id STUDY_ID `
+  --strategy-name "GRAFIKTEKI_STRATEJI_ADI" `
   --execute I_UNDERSTAND
 ```
 
-Komut mevcut sembol, timeframe ve inputları snapshot olarak alır; yalnızca aynı
-değerleri yeniden uygular ve geçici veritabanında iki doğrulanmış sonuç bekler.
+Komut önce mevcut 9222 targetlarını kaydeder, aynı oturumda iki **yeni** chart
+sekmesi açar ve yalnız bu yeni targetlara worker bağlar. Her sekmede stratejiyi
+görünür adıyla ayrı keşfeder; aynı sembol, timeframe ve bir input değerini
+yeniden uygular, geçici veritabanında iki doğrulanmış sonuç bekler. 9222 hazır
+değilse TradingView'i yeniden başlatmaz ve mevcut grafiklere dokunmaz.

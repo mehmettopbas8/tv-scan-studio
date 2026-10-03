@@ -5,6 +5,9 @@ from pathlib import Path
 import shiboken6
 
 reportlab_data = collect_data_files("reportlab", includes=["fonts/*.ttf"])
+# Research archives are private local data, never portable application assets.
+# The application handles their absence explicitly on a clean installation.
+tzdata_data = collect_data_files("tzdata")
 shiboken_dir = Path(shiboken6.__file__).parent
 msvc_runtime = [
     (str(path), ".") for path in shiboken_dir.glob("*.dll")
@@ -15,7 +18,7 @@ a = Analysis(
     ["run_tv_scan_studio.py"],
     pathex=["src"],
     binaries=msvc_runtime,
-    datas=reportlab_data,
+    datas=reportlab_data + tzdata_data,
     hiddenimports=["PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "websocket"],
     hookspath=[],
     runtime_hooks=[],

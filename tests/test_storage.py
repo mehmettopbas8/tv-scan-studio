@@ -1,5 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import subprocess
+import sys
+import json
 
 import pytest
 
@@ -21,6 +24,40 @@ def test_interrupted_tasks_are_requeued(tmp_path):
         connection.execute("UPDATE tasks SET status='running',worker_id=3")
     assert store.recover_interrupted() == 1
     assert store.counts(project) == {"pending": 1}
+
+
+def test_process_exit_recovers_claims_without_repeating_completed_results(tmp_path):
+    database = tmp_path / 'restart.db'
+    script = '''
+import os,sys
+from tv_scan_studio.storage import Store
+s=Store(sys.argv[1])
+p=s.create_project('Restart','strategy("Restart")')
+for key in ('finished','interrupted','waiting'): s.enqueue(p,key,{})
+t=s.claim_next(1,[p])
+s.complete(t.id,1,{'trades':1},'hassas',verified=True,evidence={})
+assert s.claim_next(2,[p]) is not None
+os._exit(17)
+'''
+    child = subprocess.run([sys.executable, '-c', script, str(database)],
+                           capture_output=True, text=True, timeout=30)
+    assert child.returncode == 17, child.stderr
+    recovery = '''
+import sys,json
+from tv_scan_studio.storage import Store
+s=Store(sys.argv[1]); recovered=s.recover_interrupted()
+claimed=[]
+while (t:=s.claim_next(3,[1])) is not None:
+ claimed.append(t.task_key)
+ s.complete(t.id,3,{'trades':1},'hassas',verified=True,evidence={})
+print(json.dumps({'recovered':recovered,'claimed':claimed,'counts':s.counts(1),'results':len(s.results(1))}))
+'''
+    restarted = subprocess.run([sys.executable, '-c', recovery, str(database)],
+                               capture_output=True, text=True, timeout=30)
+    assert restarted.returncode == 0, restarted.stderr
+    state = json.loads(restarted.stdout)
+    assert state == {'recovered':1,'claimed':['interrupted','waiting'],
+                     'counts':{'done':3},'results':3}
 
 
 def test_two_workers_never_claim_the_same_task(tmp_path):
@@ -67,6 +104,11 @@ def test_only_verified_running_task_can_be_completed(tmp_path):
     results = store.results(project)
     assert results[0]["metrics"] == {"profit_factor": 1.7}
     assert results[0]["verified"] is True
+    assert len(store.results(project, {"hassas", "dayanıklı"})) == 1
+    assert store.results(project, {"elenmiş", "geçersiz"}) == []
+    total, summary = store.task_summaries("done")
+    assert total == 1
+    assert summary[0]["task_key"] == "EURUSD|15"
     assert store.project(project)["status"] == "complete"
 
 
@@ -86,6 +128,35 @@ def test_project_control_retry_and_dashboard_stats(tmp_path):
     assert cancelled == 2
     stats = store.dashboard_stats(project)
     assert stats["counts"] == {"cancelled": 2}
+    assert stats["tests_per_hour"] == 0
+    assert stats["eta_seconds"] is None
+
+
+def test_dashboard_task_browser_scopes_to_one_project_and_all_states(tmp_path):
+    store = Store(tmp_path / "scoped.db")
+    first = store.create_project("First", 'strategy("First")')
+    second = store.create_project("Second", 'strategy("Second")')
+    store.enqueue(first, "one", {"symbol": "EURUSD"})
+    store.enqueue(first, "two", {"symbol": "GBPUSD"})
+    store.enqueue(second, "other", {"symbol": "USDJPY"})
+    store.cancel_pending(first)
+    total, rows = store.task_summaries(None, project_id=first)
+    assert total == 2
+    assert {row["task_key"] for row in rows} == {"one", "two"}
+    assert store.task_summaries("cancelled", project_id=first)[0] == 2
+    assert store.task_summaries("pending", project_id=first)[0] == 0
+    project = next(row for row in store.projects() if row["id"] == first)
+    assert project["cancelled_count"] == 2
+
+
+def test_dashboard_rate_requires_meaningful_sample(tmp_path):
+    store = Store(tmp_path / "rate.db")
+    project = store.create_project("Rate", 'strategy("Rate")')
+    for index in range(2):
+        store.enqueue(project, str(index), {})
+        task = store.claim_next(1)
+        store.complete(task.id, 1, {"trades": 1}, "elenmiş", verified=True)
+    stats = store.dashboard_stats(project)
     assert stats["tests_per_hour"] == 0
     assert stats["eta_seconds"] is None
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
 from typing import Any, Iterator
 
@@ -31,10 +32,26 @@ def followup_payloads(payload: dict[str, Any], alternative_symbol: str) -> Itera
         assumptions = child.setdefault("costs", {}).setdefault("assumptions", {})
         mapping = child["costs"].get("input_mapping", {})
         configured = child["costs"].setdefault("tradingview_inputs", {})
+        changed_inputs = {}
+        property_baseline = (
+            all(key in assumptions for key in ('initial_capital', 'position_size',
+                'commission_value', 'commission_type', 'slippage'))
+            and assumptions.get('commission_type') in {'percent', 'cash_per_contract', 'cash_per_order'}
+        )
+        changed_properties = False
         for name in ("commission_value", "spread", "slippage"):
-            assumptions[name] = assumptions.get(name, 0) * multiplier
-            if name in mapping:
-                configured[mapping[name]] = assumptions[name]
+            original = assumptions.get(name, 0)
+            assumptions[name] = math.ceil(original * multiplier) if name == 'slippage' else original * multiplier
+            if property_baseline and name in {'commission_value', 'slippage'} and original > 0:
+                changed_properties = True
+            input_id = mapping.get(name)
+            if input_id and original != 0 and configured.get(input_id) == original:
+                configured[input_id] = assumptions[name]
+                changed_inputs[input_id] = assumptions[name]
+        # Full Properties expectations are now applied and read back by the driver.
+        # Incomplete legacy metadata still cannot create a claimed cost stress task.
+        if not changed_inputs and not changed_properties:
+            continue
         child["validation_stage"] = "cost_stress"
         child["cost_multiplier"] = multiplier
         yield "cost_stress", child

@@ -6,9 +6,15 @@ import shutil
 from pathlib import Path
 
 
+PRIVATE_RESEARCH_FILES = {"ftmo_session_20260923.json", "ftmo_overnight_33075.jsonl.gz"}
+
+
 def build_release(source: Path, output_dir: Path, version: str) -> tuple[Path, Path, str]:
     if not (source / "TV-Scan-Studio.exe").is_file():
         raise FileNotFoundError(f"Portable uygulama bulunamadı: {source}")
+    private_files = [path for path in source.rglob("*") if path.name in PRIVATE_RESEARCH_FILES]
+    if private_files:
+        raise ValueError("Özel araştırma verisi taşınabilir pakete eklenemez.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_base = output_dir / f"TV-Scan-Studio-{version}-portable"

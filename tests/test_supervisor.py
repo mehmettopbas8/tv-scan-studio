@@ -39,10 +39,50 @@ def test_two_independent_workers_drain_queue(tmp_path):
     assert all(state.completed > 0 for state in supervisor.states.values())
 
 
+def test_workers_only_process_their_assigned_projects(tmp_path):
+    store = Store(tmp_path / "assigned-projects.db")
+    first = store.create_project("First", 'strategy("First")')
+    second = store.create_project("Second", 'strategy("Second")')
+    payload = {"study_id": "sid", "symbol": "OANDA:EURUSD", "timeframe": "15",
+               "inputs": {"in_0": 20}, "poll_interval": 0, "timeout": 1,
+               "criteria": {"min_trades": 60}}
+    for index in range(4):
+        store.enqueue(first, f"first-{index}", payload)
+        store.enqueue(second, f"second-{index}", payload)
+    supervisor = WorkerSupervisor(store, ParallelFakeDriver(), heartbeat_seconds=0.01)
+    supervisor.start([
+        WorkerAssignment(1, "target-1", (first,), "sid-one"),
+        WorkerAssignment(2, "target-2", (second,), "sid-two"),
+    ], stop_when_idle=True)
+    assert supervisor.wait(5)
+    assert store.counts(first) == {"done": 4}
+    assert store.counts(second) == {"done": 4}
+    assert supervisor.states[1].completed == 4
+    assert supervisor.states[2].completed == 4
+    assert {row["evidence"]["target_id"] for row in store.results(first)} == {"target-1"}
+    assert {row["evidence"]["target_id"] for row in store.results(second)} == {"target-2"}
+
+
 def test_supervisor_rejects_shared_target(tmp_path):
     supervisor = WorkerSupervisor(Store(tmp_path / "studio.db"), ParallelFakeDriver())
     with pytest.raises(ValueError, match="bağımsız"):
         supervisor.start([WorkerAssignment(1, "target-1", (1,)), WorkerAssignment(2, "target-1", (1,))])
+
+
+def test_changed_layout_stops_worker_without_claiming_task(tmp_path):
+    store = Store(tmp_path / "guarded.db")
+    project = store.create_project("Guarded", 'strategy("Guarded")')
+    store.enqueue(project, "pending-task", {
+        "study_id": "sid", "symbol": "OANDA:EURUSD", "timeframe": "15",
+        "inputs": {"in_0": 20}})
+    def guard(_target_id):
+        raise ValueError("layout changed")
+    supervisor = WorkerSupervisor(store, ParallelFakeDriver(), target_guard=guard)
+    supervisor.start([WorkerAssignment(1, "target-1", (project,))], stop_when_idle=True)
+    assert supervisor.wait(5)
+    assert supervisor.states[1].status == "failed"
+    assert store.counts(project) == {"pending": 1}
+    assert store.tasks(project_id=project)[0]["attempts"] == 0
 
 
 def test_supervisor_restarts_terminal_failed_worker_at_most_three_times(tmp_path, monkeypatch):
