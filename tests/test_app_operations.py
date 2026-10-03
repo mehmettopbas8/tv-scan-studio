@@ -16,6 +16,47 @@ from tv_scan_studio.app import (CurveChart, DailyPnlCalendar, MetricBarsChart,
                                 WORKER_READY_LABEL)
 from tv_scan_studio.storage import Store
 from tv_scan_studio.supervisor import WorkerAssignment
+from tv_scan_studio.tradingview import pine_source_hash
+
+
+@pytest.mark.parametrize("different_source,changed_build", [(False,False),(True,False),(False,True)])
+def test_worker_binding_checks_automatic_saved_source(tmp_path, monkeypatch, different_source, changed_build):
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = Store(tmp_path / "automatic-source.db")
+    source = 'strategy("Identity")\nlength=input.int(3,"Length")'
+    project_id = store.create_project("Identity", source)
+    studio = StudioWindow(store)
+    studio.worker_table.setRowCount(1)
+    project_choice = QtWidgets.QComboBox()
+    project_choice.addItem("Identity", project_id)
+    studio.worker_table.setCellWidget(0, 3, project_choice)
+    strategy = {"id":"sid", "pine_id":"USER;one", "name":"Identity",
+                "input_ids":["in_0"], "pine_digest":"build", "pine_version":"1.0"}
+    strategy_cell = QtWidgets.QTableWidgetItem("Identity")
+    strategy_cell.setData(QtCore.Qt.UserRole, strategy)
+    studio.worker_table.setItem(0,4,strategy_cell)
+    target_cell = QtWidgets.QTableWidgetItem("Worker 1")
+    target_cell.setData(QtCore.Qt.UserRole,"target")
+    studio.worker_table.setItem(0,2,target_cell)
+    studio.worker_table.setCurrentCell(0,4)
+    studio._safe_worker_targets = {"target":"layout"}
+    studio.driver = SimpleNamespace(
+        strategy_source_hash=lambda *_args: pine_source_hash(source + "changed" if different_source else source),
+        strategies=lambda _target:[{**strategy,"pine_digest":"changed" if changed_build else "build"}],
+    )
+    monkeypatch.setattr(studio,"discover_targets",lambda:None)
+    def no_manual_override(*_args):
+        raise AssertionError("Automatic evidence must not request manual override")
+    monkeypatch.setattr(QtWidgets.QMessageBox,"question",no_manual_override)
+    studio.bind_selected_strategy()
+    identity = (store.settings(project_id) or {}).get("tradingview_identity")
+    if different_source or changed_build:
+        assert identity is None
+        assert "bağlanmadı" in studio.worker_status.text()
+    else:
+        assert identity["source_verification"] == "editor_saved_source_sha256"
+        assert identity["source_sha256"] == pine_source_hash(source)
+    studio.window.close()
 
 
 def test_app_builds_operational_controls_and_cost_mapping(tmp_path):

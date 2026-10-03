@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import re
 import time
@@ -292,6 +293,46 @@ class GncZihinDriver:
         with ThreadPoolExecutor(max_workers=min(16, max(1, len(targets)))) as pool:
             return list(pool.map(inspect, targets))
 
+    def strategy_source_hash(self, target_id: str, study_id: str) -> str:
+        """Hash saved source from the target's own open Pine editor.
+
+        Editor hooks must identify the applied study's exact Pine ID/version.
+        A closed editor, partial accessibility text, or another editor's source
+        is not evidence. Unsaved draft text is deliberately not used.
+        """
+        data = self._motor._eval(target_id, r'''(()=>{
+          const c=TradingViewApi._activeChartWidgetWV.value();
+          const study=c._chartWidget.model().dataSources().find(x=>x.id()===STUDY_ID);
+          if(!study||typeof study.reportData!=='function')return null;
+          const pineId=c.getStudyById(STUDY_ID)?.getInputValues?.()
+            ?.find(v=>v.id==='pineId')?.value;
+          const version=study.metaInfo?.()?.pine?.version;
+          const editors=[...document.querySelectorAll('.monaco-editor')]
+            .filter(e=>e.offsetWidth>0&&e.offsetHeight>0
+              &&getComputedStyle(e).visibility!=='hidden');
+          if(editors.length!==1||!pineId||!version)return null;
+          let e=editors[0],fiber=null;
+          for(let i=0;e&&i<6;i++,e=e.parentElement){
+            const k=Object.keys(e).find(k=>k.startsWith('__reactFiber'));
+            if(k){fiber=e[k];break;}
+          }
+          const matches=[];
+          for(let i=0;fiber&&i<8;i++,fiber=fiber.return){
+            let hook=fiber.memoizedState;
+            for(let j=0;hook&&j<50;j++,hook=hook.next){
+              const v=hook.memoizedState;
+              if(v&&typeof v.scriptSource==='string'&&v.scriptIdPart===pineId
+                &&String(v.version)===String(version))matches.push(v.scriptSource);
+            }
+          }
+          if(!matches.length||matches.some(s=>s!==matches[0]))return null;
+          return {source:matches[0],pine_id:pineId,version:String(version)};
+        })()'''.replace('STUDY_ID', json.dumps(study_id)))
+        if (not isinstance(data, dict) or not isinstance(data.get("source"), str)
+                or not data["source"] or not data.get("pine_id") or not data.get("version")):
+            raise TradingViewError("Bağlı stratejinin tam Pine kaynağı okunamadı; kaynak eşleşmesi doğrulanmadı.")
+        return pine_source_hash(data["source"])
+
     def _eval(self, target_id: str, study_id: str, body: str) -> Any:
         prefix = (
             "const c=TradingViewApi._activeChartWidgetWV.value(),"
@@ -551,6 +592,12 @@ def strategy_structure_matches(strategy: dict[str, Any], expected_title: str,
     return str(strategy.get("name") or "").strip() == expected_title.strip() and expected_ids <= observed_ids
 
 
+def pine_source_hash(source: str) -> str:
+    """Normalize only editor line endings, preserving all code and whitespace."""
+    canonical = source.replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def confirmed_strategy_identity_matches(strategy: dict[str, Any], identity: dict[str, Any],
                                         *, pine_hash: str, expected_title: str,
                                         expected_input_count: int) -> bool:
@@ -563,7 +610,14 @@ def confirmed_strategy_identity_matches(strategy: dict[str, Any], identity: dict
         and isinstance(properties, list) and properties
         and saved == observed + properties
     )
+    automatic_evidence_valid = identity.get("source_verification") != "editor_saved_source_sha256" or bool(
+        isinstance(identity.get("source_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", identity["source_sha256"])
+        and identity.get("pine_digest") and identity.get("pine_version")
+    )
     return bool(
+        automatic_evidence_valid
+        and
         strategy_structure_matches(strategy, expected_title, expected_input_count)
         and isinstance(observed, list) and isinstance(saved, list) and saved
         and all(isinstance(value, str) for value in observed)

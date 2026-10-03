@@ -1,5 +1,29 @@
 from tv_scan_studio.tradingview import (GncZihinDriver, confirmed_strategy_identity_matches,
                                         strategy_structure_matches)
+import pytest
+from tv_scan_studio.tradingview import TradingViewError, pine_source_hash
+
+
+def test_source_hash_normalizes_only_line_endings():
+    assert pine_source_hash('strategy("Demo")\r\n') == pine_source_hash('strategy("Demo")\n')
+    assert pine_source_hash('strategy("Demo")\n') != pine_source_hash('strategy("Other")\n')
+    assert pine_source_hash('strategy("Demo")\n') != pine_source_hash('strategy("Demo")\n\n')
+
+
+def test_source_hash_reads_complete_bound_saved_source(monkeypatch):
+    driver = GncZihinDriver()
+    monkeypatch.setattr(driver._motor, "_eval", lambda *_args: {
+        "source": 'strategy("Demo")\r\n', "pine_id": "USER;one", "version": "1.0"})
+    assert driver.strategy_source_hash("target", "study") == pine_source_hash('strategy("Demo")\n')
+
+
+@pytest.mark.parametrize("data", [None, {}, {"source": ""},
+    {"source": 'strategy("Demo")', "pine_id": "USER;one"}, {"source": 123}])
+def test_source_hash_rejects_unavailable_or_partial_evidence(monkeypatch, data):
+    driver = GncZihinDriver()
+    monkeypatch.setattr(driver._motor, "_eval", lambda *_args: data)
+    with pytest.raises(TradingViewError, match="doğrulanmadı"):
+        driver.strategy_source_hash("target", "study")
 
 
 def test_inventory_keeps_failed_targets(monkeypatch):
@@ -83,3 +107,17 @@ def test_confirmed_identity_rejects_changed_build_with_same_title_and_inputs():
     assert not check({**strategy, "pine_digest": "another-build"})
     assert not check({**strategy, "pine_digest": None})
     assert not check({**strategy, "pine_version": "2.0"})
+
+
+def test_automatic_source_evidence_requires_hash_and_bound_build():
+    strategy = {"name":"Demo", "pine_id":"USER;one", "input_ids":["in_0"],
+                "pine_digest":"build", "pine_version":"1.0"}
+    identity = {**strategy, "pine_hash":"project", "user_source_confirmed":True,
+                "source_verification":"editor_saved_source_sha256", "source_sha256":"a"*64}
+    def check(saved):
+        return confirmed_strategy_identity_matches(strategy,saved,pine_hash="project",
+            expected_title="Demo",expected_input_count=1)
+    assert check(identity)
+    for key in ("source_sha256","pine_digest","pine_version"):
+        assert not check({**identity,key:None})
+    assert not check({**identity,"source_sha256":"partial"})

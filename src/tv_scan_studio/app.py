@@ -21,7 +21,7 @@ from .backup import create_backup, verify_backup
 from .resources import project_worker_throughput, recommend_workers, system_snapshot
 from .supervisor import WorkerAssignment, WorkerSupervisor
 from .tradingview import (GncZihinDriver, confirmed_strategy_identity_matches,
-                          strategy_structure_matches)
+                          TradingViewError, pine_source_hash, strategy_structure_matches)
 from .windows import (TabCreationError, cdp_healthy, chart_targets, find_tradingview_executables,
                       launch_with_cdp, open_chart_tabs, worker_layout_candidates)
 from .storage import Store
@@ -1859,7 +1859,28 @@ class StudioWindow:
             strategy = self.worker_table.item(row, 4).data(QtCore.Qt.UserRole)
             if not strategy or not strategy.get("pine_id"):
                 raise ValueError("Bu satırda bağlanabilir Pine kimliği yok.")
-            answer = self.QtWidgets.QMessageBox.question(
+            project = self.store.project(project_id)
+            target_cell = self.worker_table.item(row, 2)
+            target_id = target_cell.data(QtCore.Qt.UserRole) if target_cell else None
+            automatic_source_hash = None
+            reader = getattr(self.driver, "strategy_source_hash", None)
+            if callable(reader) and target_id in self._safe_worker_targets:
+                try:
+                    automatic_source_hash = reader(target_id, strategy["id"])
+                except TradingViewError:
+                    pass  # An unavailable editor is not a match or a mismatch.
+            if (automatic_source_hash is not None
+                    and automatic_source_hash != pine_source_hash(project["pine_source"])):
+                raise ValueError("Grafikteki Pine kaynağı proje koduyla farklı; worker bağlanmadı.")
+            if automatic_source_hash:
+                observed = [item for item in self.driver.strategies(target_id)
+                            if item.get("id") == strategy["id"]]
+                if (len(observed) != 1 or not strategy.get("pine_digest")
+                        or not strategy.get("pine_version")
+                        or any(observed[0].get(key) != strategy.get(key)
+                               for key in ("pine_id", "pine_digest", "pine_version", "input_ids"))):
+                    raise ValueError("Kaynak okunurken strateji kimliği değişti; worker bağlanmadı.")
+            answer = self.QtWidgets.QMessageBox.Yes if automatic_source_hash else self.QtWidgets.QMessageBox.question(
                 self.window, "Strateji kaynağını kontrol et",
                 "Uygulama grafikteki Pine kodunun tamamını otomatik karşılaştıramıyor. "
                 "Bu çalışma sekmesindeki stratejinin projeye yapıştırdığınız kodla aynı "
@@ -1874,6 +1895,8 @@ class StudioWindow:
                 "input_ids": strategy.get("input_ids", []),
                 "pine_hash": self.store.project(project_id)["pine_hash"],
                 "user_source_confirmed": True,
+                "source_verification": "editor_saved_source_sha256" if automatic_source_hash else "user_confirmation",
+                "source_sha256": automatic_source_hash,
             }})
             self.discover_targets()
         except ValueError as exc:
