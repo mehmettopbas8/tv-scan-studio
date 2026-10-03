@@ -6,6 +6,7 @@
 - Added persistent Pine identity and source-hash binding, including guarded temporary opening/restoration of a closed worker Pine panel. Existing editors are preserved; unavailable source still requires explicit user confirmation and is not automatic equality evidence.
 - Added operational dashboard controls, retry/recovery, resource projections and worker restart supervision.
 - Added FTMO profiles, editable cost assumptions and staged robustness validation.
+- Reject fixed direct-input order quantity conflicts with the default Properties quantity; preserve explicit quantity scans and document the limits of computed-sizing verification.
 - Added interactive trade analytics, preset comparison, CSV/Excel export and success-only PDF reports, plus checksummed backups.
 - Added task-bound dated Deep reports with fresh XLSX identity/input/cost verification and Strategy Properties commission/slippage application.
 - Restored saved scan settings on project selection, isolated project defaults, and corrected minute/hour resolution mapping.

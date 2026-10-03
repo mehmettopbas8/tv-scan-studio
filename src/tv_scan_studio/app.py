@@ -2604,9 +2604,13 @@ class StudioWindow:
                     raise ValueError("Aynı strateji inputu iki farklı maliyet alanına eşlenemez.")
                 tradingview_inputs[input_id] = value
                 input_mapping[name] = input_id
-        from .cost_application import validate_spread_mapping
+        from .cost_application import validate_spread_mapping, validate_direct_order_quantity
         validate_spread_mapping({"assumptions": assumptions, "tradingview_inputs": tradingview_inputs,
                                  "input_mapping": input_mapping})
+        selected_project = self.store.project(self.plan_project.currentData())
+        if selected_project:
+            validate_direct_order_quantity(selected_project["pine_source"], values,
+                {"assumptions": assumptions, "tradingview_inputs": tradingview_inputs})
         success_criteria = {
             "min_trades": self.min_trades.value(), "min_profit_factor": self.min_pf.value(),
             "min_win_rate_pct": self.min_win.value(), "max_drawdown_pct_exclusive": self.max_dd.value(),

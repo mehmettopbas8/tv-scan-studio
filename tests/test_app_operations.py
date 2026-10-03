@@ -19,6 +19,34 @@ from tv_scan_studio.supervisor import WorkerAssignment
 from tv_scan_studio.tradingview import pine_source_hash
 
 
+def test_plan_direct_contract_quantity_mapping_and_scan(tmp_path):
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = Store(tmp_path / "quantity-plan.db")
+    project_id = store.create_project("Quantity", 'strategy("Quantity")\n'
+        'size=input.float(1.0,"Contracts")\n'
+        'strategy.entry("L",strategy.long,qty=size)')
+    studio = StudioWindow(store)
+    try:
+        studio.refresh_project_selectors()
+        studio.plan_project.setCurrentIndex(studio.plan_project.findData(project_id))
+        studio.plan_inputs.cellWidget(0, 3).setCurrentText("Sabit bırak")
+        studio.position_size.setValue(2)
+        with pytest.raises(ValueError, match="Contracts"):
+            studio._current_plan()
+        choice = studio.cost_input_choices["position_size"]
+        choice.setCurrentIndex(choice.findData("in_0"))
+        mapped = studio._current_plan()
+        assert mapped.costs["tradingview_inputs"]["in_0"] == 2
+        choice.setCurrentIndex(0)
+        studio.plan_inputs.cellWidget(0, 3).setCurrentText("Tara")
+        studio.plan_inputs.item(0, 4).setData(QtCore.Qt.UserRole, [1, 2])
+        scanned = studio._current_plan()
+        assert scanned.input_values["in_0"] == [1, 2]
+        assert scanned.costs["tradingview_inputs"] == {}
+    finally:
+        studio.window.close()
+
+
 @pytest.mark.parametrize("different_source,changed_build", [(False,False),(True,False),(False,True)])
 def test_worker_binding_checks_automatic_saved_source(tmp_path, monkeypatch, different_source, changed_build):
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

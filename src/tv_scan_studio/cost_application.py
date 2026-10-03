@@ -3,7 +3,50 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
+
+
+def validate_direct_order_quantity(source: str, input_values: dict[str, list[Any]],
+                                   costs: dict[str, Any]) -> None:
+    """Reject a misleading Properties quantity for directly input-sized orders.
+
+    This deliberately does not claim to interpret computed risk-sizing expressions.
+    Literal strings/comments are masked before finding executable entry/order calls.
+    """
+    from .pine import _call_body, _named_argument, _split_arguments, parse_strategy_inputs
+
+    masked = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*',
+                    lambda match: ' ' * len(match[0]), source)
+    definitions = {item.variable: (f'in_{index}', item)
+                   for index, item in enumerate(parse_strategy_inputs(source))}
+    expected = (costs.get('assumptions') or {}).get('position_size')
+    if expected is None:
+        return
+    for match in re.finditer(r'\bstrategy\.(?:entry|order)\s*\(', masked):
+        body = _call_body(masked, match.end() - 1)
+        if body is None:
+            continue
+        arguments = dict(_named_argument(argument) for argument in _split_arguments(body))
+        expression = arguments.get('qty', '').strip()
+        if expression not in definitions:
+            continue
+        key, item = definitions[expression]
+        if item.kind not in {'int', 'float'} or item.manual_definition_required:
+            continue
+        override = (costs.get('tradingview_inputs') or {}).get(key)
+        selected = [override] if override is not None else input_values.get(key, [item.default])
+        # An explicit quantity scan is intentional; don't replace or suppress its
+        # combinations with a single Properties value. This check targets fixed
+        # quantity setups only, not economic verification of a sizing scan.
+        if len(selected) > 1 and override is None:
+            continue
+        if any(value != expected for value in selected):
+            raise ValueError(
+                f'Emir miktarı stratejide “{item.title}” inputundan belirleniyor. '
+                'TradingView varsayılan pozisyon ayarı bunu değiştirmez. '
+                'Pozisyon boyutunu bu inputa eşleyin veya input değerleriyle aynı tutun.'
+            )
 
 
 def strategy_property_values(definitions: list[dict[str, Any]],

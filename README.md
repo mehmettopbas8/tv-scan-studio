@@ -58,8 +58,9 @@ dist\TV-Scan-Studio\TV-Scan-Studio.exe --self-test
 ```
 
 Uygulama mevcut TradingView taramalarından ayrı çalışır. Uygulama açılışta hiçbir
-grafiği veya layout'u değiştirmez; CDP otomasyonu yalnızca kullanıcı workerları
-başlattığında devreye girer.
+grafiği veya layout'u değiştirmez. Kullanıcının kaynak bağlama, worker hazırlama
+ve tarama eylemleri CDP otomasyonunu başlatabilir; kaynak okuma için açılan
+worker Pine panelinin yeniden kapandığı doğrulanır.
 
 Tarama kendiliğinden başlamaz. Kullanıcı önce Pine projesini ve görev planını
 kaydeder, Worker dağıtımı ekranında CDP targetlarını bulur ve ardından
@@ -68,6 +69,14 @@ kapanırsa yarım kalan görevler yeniden bekleme kuyruğuna alınır.
 
 Temel kriterleri geçen tek ölçüm `hassas` kabul edilir. `dayanıklı` sınıfı için
 komşu değer, maliyet stresi ve farklı sağlayıcı kontrollerinin üçü de gerekir.
+
+Strateji emirlerinde miktar doğrudan bir Pine inputundan (örneğin `Contracts`)
+alınıyorsa TradingView'in varsayılan pozisyon alanı bu miktarı değiştirmez.
+Sabit input değeri pozisyon ayarıyla çelişirse plan oluşturulmaz; pozisyon
+alanını ilgili inputa eşleyin veya değerleri aynı tutun. Birden fazla kontrat
+değerinin taranması korunur ve bu durumda emir miktarını seçilen input değerleri
+belirler. Bu kontrol hesaplanmış risk/miktar ifadelerini yorumlamaz; Properties
+değerinin okunması tek başına gerçek işlem miktarının ekonomik doğrulaması değildir.
 
 TradingView Desktop yalnızca `9222` portuyla açılır. Ek workerlar ikinci bir
 port veya ikinci hesap oturumu başlatmaz; uygulama aynı CDP profili içinde yeni

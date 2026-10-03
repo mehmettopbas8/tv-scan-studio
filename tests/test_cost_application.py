@@ -4,6 +4,32 @@ from tv_scan_studio.cost_application import strategy_property_values
 from tv_scan_studio.tradingview import GncZihinDriver, TradingViewError
 
 
+@pytest.mark.parametrize('mapped', [False, True])
+def test_direct_pine_qty_cannot_be_replaced_by_properties_only(mapped):
+    from tv_scan_studio.cost_application import validate_direct_order_quantity
+    source = 'strategy("Size")\nsize=input.float(1.0,"Contracts")\nstrategy.entry("L", strategy.long, qty=size)'
+    costs = {'assumptions': {'position_size': 2},
+             'tradingview_inputs': {'in_0': 2} if mapped else {}}
+    if mapped:
+        validate_direct_order_quantity(source, {'in_0': [1]}, costs)
+    else:
+        with pytest.raises(ValueError, match='Contracts'):
+            validate_direct_order_quantity(source, {'in_0': [1]}, costs)
+
+
+def test_direct_qty_respects_scan_values_and_ignores_comments_and_strings():
+    from tv_scan_studio.cost_application import validate_direct_order_quantity
+    source = 'strategy("Size")\nsize=input.float(1.0,"Contracts")\n'
+    fake = '// strategy.entry("L", strategy.long, qty=size)\nlabel="strategy.order(a,b,qty=size)"'
+    validate_direct_order_quantity(source + fake, {'in_0': [1]},
+                                   {'assumptions': {'position_size': 2}})
+    live = 'strategy.order("L", strategy.long, qty=size)'
+    validate_direct_order_quantity(source + live, {'in_0': [2]},
+                                   {'assumptions': {'position_size': 2}})
+    validate_direct_order_quantity(source + live, {'in_0': [1, 2]},
+                                   {'assumptions': {'position_size': 2}})
+
+
 def definitions():
     names = [('Initial Capital', 'float'), ('Default entry/order Qty Value', 'float'),
              ('Commission Value', 'float'), ('Backtesting slippage for market orders', 'integer'),
