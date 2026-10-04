@@ -69,6 +69,31 @@ def test_supervisor_rejects_shared_target(tmp_path):
         supervisor.start([WorkerAssignment(1, "target-1", (1,)), WorkerAssignment(2, "target-1", (1,))])
 
 
+@pytest.mark.parametrize("failures", [1, 3])
+def test_retry_attempts_do_not_inflate_completed_tests(tmp_path, failures):
+    class RetryDriver(ParallelFakeDriver):
+        calls = 0
+
+        def configure(self, *args):
+            self.calls += 1
+            if self.calls <= failures:
+                raise RuntimeError("temporary failure")
+
+    store = Store(tmp_path / "retry.db")
+    project = store.create_project("Retry", 'strategy("Retry")')
+    store.enqueue(project, "one-test", {
+        "study_id": "sid", "symbol": "OANDA:EURUSD", "timeframe": "15",
+        "inputs": {"in_0": 20}, "poll_interval": 0, "timeout": 1,
+    })
+    supervisor = WorkerSupervisor(store, RetryDriver())
+    supervisor.start([WorkerAssignment(1, "target-1", (project,))], stop_when_idle=True)
+    assert supervisor.wait(5)
+    state = supervisor.states[1]
+    assert state.attempts == (2 if failures == 1 else 3)
+    assert state.completed == (1 if failures == 1 else 0)
+    assert store.counts(project) == ({"done": 1} if failures == 1 else {"manual_review": 1})
+
+
 def test_changed_layout_stops_worker_without_claiming_task(tmp_path):
     store = Store(tmp_path / "guarded.db")
     project = store.create_project("Guarded", 'strategy("Guarded")')

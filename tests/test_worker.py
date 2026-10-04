@@ -67,6 +67,43 @@ def test_wait_requires_stable_matching_symbol_timeframe_inputs_and_period():
     assert result.metrics["profit_factor"] == 1.5
 
 
+def test_old_completed_report_is_rejected_until_new_report_even_with_identical_metrics():
+    expected = {"symbol": "OANDA:EURUSD", "timeframe": "15", "inputs": {"in_0": 20},
+                "require_fresh_report": True}
+    old = replace(snapshot(), report_fresh=False)
+    fresh = replace(snapshot(), report_fresh=True)
+    driver = FakeDriver([old] * 5 + [fresh] * 3)
+    result = wait_for_verified_result(driver, "target-1", "study-1", expected,
+        timeout=1, poll_interval=0, stable_reads=3)
+    assert result.report_fresh is True
+    assert result.metrics == old.metrics  # Identical outcomes are legal; stale objects are not.
+
+
+@pytest.mark.parametrize("fresh", [False, None])
+def test_stable_input_echo_without_report_freshness_cannot_verify(fresh):
+    from tv_scan_studio.tradingview import VerificationMismatch
+    driver = FakeDriver([replace(snapshot(), report_fresh=fresh)] * 30)
+    with pytest.raises(VerificationMismatch):
+        wait_for_verified_result(driver, "target-1", "study-1",
+            {"symbol": "OANDA:EURUSD", "timeframe": "15", "inputs": {"in_0": 20},
+             "require_fresh_report": True}, timeout=.1, poll_interval=0, stable_reads=3)
+
+
+def test_report_restart_requires_guard_and_records_old_object_before_restart():
+    driver = GncZihinDriver()
+    with pytest.raises(TradingViewError, match="koruması"):
+        driver.refresh_chart_report("owned", "study")
+    events = []
+    driver.target_guard = lambda target: events.append(("guard", target))
+    def evaluate(target, study, body):
+        assert body.index("before:s.reportData()") < body.index("s.restart(true)")
+        events.append(("restart", target))
+        return True
+    driver._eval = evaluate
+    driver.refresh_chart_report("owned", "study")
+    assert events == [("guard", "owned"), ("restart", "owned"), ("guard", "owned")]
+
+
 def test_matching_chart_dates_cannot_verify_deep_report():
     from tv_scan_studio.tradingview import VerificationMismatch
 
@@ -107,6 +144,27 @@ def test_provider_qualified_symbol_must_match_exactly():
     assert symbol_matches("OANDA:DE30EUR", "OANDA:DE30EUR")
     assert not symbol_matches("OANDA:DE30EUR", "FX:DE30EUR")
     assert symbol_matches("DE30EUR", "OANDA:DE30EUR")
+
+
+def test_delayed_symbol_requires_authoritative_current_series_identity():
+    identity = {"full_name": "BIST_DLY:XU030D1!", "pro_name": "BIST:XU030D1!",
+                "name": "XU030D1!", "exchange": "BIST"}
+    assert symbol_matches("BIST:XU030D1!", "BIST_DLY:XU030D1!", identity)
+    assert not symbol_matches("BIST:XU030D1!", "BIST_DLY:XU030D1!")
+    for key in identity:
+        assert not symbol_matches("BIST:XU030D1!", "BIST_DLY:XU030D1!",
+                                  {**identity, key: "different"})
+    assert not symbol_matches("FX:XU030D1!", "BIST_DLY:XU030D1!", identity)
+
+
+def test_delayed_symbol_can_verify_stable_results_without_relaxing_provider():
+    observed = replace(snapshot(symbol="BIST_DLY:XU030D1!"), symbol_identity={
+        "full_name": "BIST_DLY:XU030D1!", "pro_name": "BIST:XU030D1!",
+        "name": "XU030D1!", "exchange": "BIST"})
+    result = wait_for_verified_result(FakeDriver([observed] * 3), "target-1", "study-1",
+        {"symbol": "BIST:XU030D1!", "timeframe": "15", "inputs": {"in_0": 20}},
+        timeout=1, poll_interval=0, stable_reads=3)
+    assert result.symbol_identity["pro_name"] == "BIST:XU030D1!"
 
 
 def test_scan_worker_completes_a_verified_task(tmp_path):
@@ -231,7 +289,7 @@ def test_dated_worker_uses_deep_capture_not_chart_summary(tmp_path, monkeypatch)
             report=SimpleNamespace(
                 metrics={"trades": 100, "profit_factor": 1.5, "win_rate_pct": 45,
                          "max_drawdown_pct": 4, "net_profit": 1000}, sha256="fresh-task-xlsx"),
-            trades=(), chart_timezone="UTC", verified_changed_inputs=("in_0",),
+            trades=(), chart_timezone="UTC", verified_changed_inputs=("in_0",), symbol_identity=None,
         )
     monkeypatch.setattr(worker_module, "capture_task_deep_export", fake_capture)
     guard = lambda target: None

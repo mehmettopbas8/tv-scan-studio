@@ -1,11 +1,75 @@
-"""Read-only access to the preserved 23 September scan's actual task rows."""
-
+"""Read legacy scan evidence without turning it into newly verified results."""
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 from importlib.resources import files
+from pathlib import Path
 
+
+def legacy_scan_record(source: dict, index: int, *, source_sha256: str) -> dict:
+    original = source
+    if isinstance(source, dict) and isinstance(source.get("payload"), dict):
+        source = {**source["payload"], **(source.get("result") or {})}
+    if not isinstance(source, dict) or not isinstance(source.get("params"), dict):
+        raise ValueError(f"Geçmiş kayıt {index}: strateji ayarları eksik.")
+    if not isinstance(source.get("symbol"), str) or not source.get("tf"):
+        raise ValueError(f"Geçmiş kayıt {index}: sembol veya zaman dilimi eksik.")
+    metrics = source.get("metrics") or {}
+    if not isinstance(metrics, dict):
+        raise ValueError(f"Geçmiş kayıt {index}: ölçümler geçersiz.")
+    mapped = { {"pf": "profit_factor", "win": "win_rate_pct", "dd": "max_drawdown_pct",
+                "net": "net_profit"}.get(key, key): value for key, value in metrics.items() }
+    identity = hashlib.sha256(json.dumps(source, sort_keys=True, ensure_ascii=False,
+                                         separators=(",", ":")).encode("utf-8")).hexdigest()
+    valid = source.get("valid") is True
+    raw_status = source.get("status") if isinstance(source.get("status"), dict) else {}
+    description = raw_status.get("errorDescription") or {}
+    error = source.get("error") or (description.get("error") if isinstance(description, dict) else description) or ""
+    if not valid and not error:
+        error = "Kaynak kayıtta hata ayrıntısı yok; geçmiş test geçersiz olarak işaretlenmiş."
+    return {
+        "task_id": index, "task_key": "historical:" + identity,
+        "status": "done" if valid else "failed",
+        "classification": ("geçmiş başarılı" if source.get("pass") is True else "geçmiş elenmiş")
+                          if valid else "geçmiş teknik hata",
+        "verified": False,
+        "error": str(error), "attempts": source.get("attempts", 1),
+        "started_at": None, "finished_at": source.get("at"),
+        "payload": {
+            "symbol": source["symbol"], "timeframe": str(source["tf"]),
+            "inputs": dict(source["params"]),
+            "date_range": ((source.get("period") or {}).get("dateRange") or {}).get("backtest", {}),
+            "research_source_id": source.get("preset_id"), "variant": source.get("variant"),
+            "historical_import": True,
+        },
+        "metrics": mapped,
+        "evidence": {"scope": "Geçmiş arşiv; bu uygulamada yeniden doğrulanmadı",
+                     "archive_sha256": source_sha256, "archive_row": index,
+                     "historical_pine_sha256": None, "legacy_record": original},
+    }
+
+
+def iter_legacy_scan_records(path: str | Path):
+    """Stream JSONL/gzip records, retaining the full original row as evidence."""
+    path = Path(path)
+    checksum = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    opener = gzip.open if path.suffix == ".gz" else open
+    index = 0
+    with opener(path, "rt", encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                source = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Geçmiş arşivin {line_number}. satırı okunamadı.") from exc
+            index += 1
+            yield legacy_scan_record(source, index, source_sha256=checksum.hexdigest())
 
 ARCHIVE_NAME = "ftmo_overnight_33075.jsonl.gz"
 

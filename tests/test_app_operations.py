@@ -19,6 +19,92 @@ from tv_scan_studio.supervisor import WorkerAssignment
 from tv_scan_studio.tradingview import pine_source_hash
 
 
+def test_results_first_use_help_persists_and_can_be_reopened(tmp_path):
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = Store(tmp_path / "first-use.db")
+    studio = StudioWindow(store)
+    try:
+        assert studio.results_help_panel.isHidden()
+        assert "Her nokta bir testtir" in studio.results_help_text.text()
+        assert "garanti etmez" in studio.results_help_text.text()
+        studio.results_help_dismiss.click()
+        assert studio.results_help_panel.isHidden()
+        assert store.app_settings()["results_help_dismissed_v1"] is True
+        studio.results_help_button.click()
+        assert studio.guided_tour is not None
+        studio.guided_tour.finish()
+        assert "oranı" in studio.results_table.horizontalHeaderItem(5).toolTip()
+    finally:
+        studio.window.close()
+    reopened = StudioWindow(store)
+    try:
+        assert reopened.results_help_panel.isHidden()
+        reopened.results_help_button.click()
+        assert reopened.guided_tour is not None
+        reopened.guided_tour.finish()
+    finally:
+        reopened.window.close()
+
+
+def test_page_hints_and_preset_values_are_readable_and_persistent(tmp_path, monkeypatch):
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = Store(tmp_path / "preset-help.db")
+    project = store.create_project("EMA", 'strategy("EMA")\nn=input.int(8,"Fast EMA")\ns=input.int(21,"Slow EMA")')
+    studio = StudioWindow(store)
+    help_windows = []
+    monkeypatch.setattr(studio, "start_guided_tour", lambda key: help_windows.append(key))
+    try:
+        studio.result_project.setCurrentIndex(studio.result_project.findData(project))
+        row = {"task_id": 123, "task_key": "test-preset", "metrics": {},
+               "payload": {"inputs": {"in_0": 9, "in_1": 21, "unknown": 42}}}
+        studio._result_by_id = {123: row}
+        studio.open_result_details_by_id(123)
+        table = studio.result_preset_table
+        assert [table.item(0, c).text() for c in range(4)] == ["Fast EMA", "8", "9", "Farklı"]
+        assert table.item(1, 3).text() == "Aynı"
+        assert table.item(2, 1).text() == "Bilinmiyor"
+        assert table.item(2, 3).text() == "Karşılaştırılamıyor"
+        for key in ("strategies", "scan", "detail"):
+            panel, button, dismiss, label = studio.usage_help[key]
+            assert panel.isHidden() and label.text()
+            dismiss.click()
+            assert panel.isHidden()
+            button.click()
+            assert panel.isHidden()
+            button.click()
+            assert help_windows[-1] == key
+        assert len(help_windows) == 6
+    finally:
+        studio.window.close()
+    reopened = StudioWindow(store)
+    try:
+        assert reopened.usage_help["strategies"][0].isHidden()
+        assert reopened.usage_help["scan"][0].isHidden()
+    finally:
+        reopened.window.close()
+
+
+def test_helper_startup_failure_is_explained_and_offers_manual_picker(tmp_path, monkeypatch):
+    from tv_scan_studio import app
+    from tv_scan_studio.processes import HelperStartupError
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    studio = StudioWindow(Store(tmp_path / "helper-error.db"))
+    def fail():
+        raise HelperStartupError(0xc0000142)
+    monkeypatch.setattr(app, "find_tradingview_executables", fail)
+    picked = []
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+        lambda *args: (picked.append(args) or ("", "")))
+    try:
+        studio.find_tradingview()
+        assert len(picked) == 1
+        assert "elle seçin" in studio.worker_status.text()
+        assert "0xc0000142" in studio.worker_status.toolTip()
+        assert "0xc0000142" not in studio.worker_status.text()
+    finally:
+        studio.window.close()
+
+
 @pytest.mark.parametrize("existing_destination,cancel", [(False, False), (True, False), (False, True)])
 def test_restore_ui_preserves_active_store(tmp_path, monkeypatch, existing_destination, cancel):
     from tv_scan_studio.backup import create_backup
@@ -368,6 +454,9 @@ def test_success_view_explains_when_only_eliminated_results_exist(tmp_path):
     studio.refresh_project_selectors()
     studio.result_project.setCurrentIndex(studio.result_project.findData(project_id))
     studio.refresh_results()
+    assert studio.result_filter.currentText() == "Tümü"
+    assert studio.results_table.rowCount() == 1
+    studio.result_filter.setCurrentText("Başarılı")
     assert studio.result_filter.currentText() == "Başarılı"
     assert studio.results_table.rowCount() == 0
     assert "Bu görünümde sonuç yok" in studio.result_empty.text()
@@ -414,6 +503,7 @@ def test_active_result_filters_are_visible_and_clear_together(tmp_path):
     assert isinstance(studio.pages.widget(4), QtWidgets.QScrollArea)
     studio.refresh_project_selectors()
     studio.result_project.setCurrentIndex(studio.result_project.findData(project_id))
+    studio.result_filter.setCurrentText("Başarılı")
     studio.filter_pf.setValue(2)
     studio.filter_symbol.setText("EUR")
     assert studio.results_table.rowCount() == 0
@@ -438,6 +528,9 @@ def test_empty_results_filter_chip_does_not_expand_into_blank_panel(tmp_path):
     store = Store(tmp_path / "compact-filter-chip.db")
     store.create_project("Demo", 'strategy("Demo")')
     studio = StudioWindow(store)
+    studio.refresh_results()
+    assert studio.result_active_filters.isHidden()
+    studio.result_filter.setCurrentText("Başarılı")
     studio.window.resize(1240, 810)
     studio.window.show()
     studio._show_page(4)
@@ -539,14 +632,14 @@ def test_real_ict_project_previews_without_strategy_id_or_json(tmp_path):
     assert studio.plan_inputs.cellWidget(color_row, 3).currentText() == "Hariç tut"
     assert studio._current_plan().task_count == 1
     assert studio.study_id.text() == ""
-    assert not studio.enqueue_plan_button.isEnabled()
+    assert studio.enqueue_plan_button.isEnabled()  # The primary action now prepares the connection and study.
     assert "1 görev" in studio.plan_status.text()
     studio.plan_inputs.cellWidget(0, 3).setCurrentText("Tara")
     assert studio._current_plan().task_count == 3
     assert "3 görev" in studio.plan_status.text()
     assert "7.5 KB" in studio.plan_status.text()
     assert "ZigZag Length ×3" in studio.plan_factors.text()
-    assert "3 input birleşimi = 3 görev" in studio.plan_factors.text()
+    assert "3 ayar birleşimi = 3 test" in studio.plan_factors.text()
     studio.window.resize(1280, 720)
     studio.window.show()
     studio._show_page(2)
@@ -748,7 +841,7 @@ def test_failed_strategy_rediscovery_clears_stale_queue_binding(tmp_path, monkey
     studio.discover_plan_strategies()
     assert studio.study_id.text() == ""
     assert studio.strategy_picker.currentData() is None
-    assert not studio.enqueue_plan_button.isEnabled()
+    assert studio.enqueue_plan_button.isEnabled()  # Re-preparation is allowed; stale queue binding is not.
     assert "bağlantı kesildi" in studio.plan_status.text()
     studio.enqueue_current_plan()
     assert store.counts(store.projects()[0]["id"]) == {}
@@ -803,7 +896,7 @@ def test_project_selection_restores_saved_symbols_timeframes_and_dates(tmp_path)
     studio.plan_project.setCurrentIndex(studio.plan_project.findData(project))
     studio.load_plan_inputs()
     assert studio.symbols.text() == 'OANDA:EURUSD'
-    assert studio.timeframes.text() == '1m, 2m'
+    assert studio.timeframes.text() == '1 dakika, 2 dakika'
     assert studio.date_from.text() == '2026-09-15'
     assert studio.date_to.text() == '2026-09-23'
     assert studio.plan_inputs.cellWidget(0,3).currentText() == 'Sabit bırak'
@@ -1033,6 +1126,7 @@ def test_pdf_export_excludes_unverified_candidate(tmp_path, monkeypatch):
     studio = StudioWindow(store)
     studio.refresh_project_selectors()
     studio.result_project.setCurrentIndex(studio.result_project.findData(project))
+    studio.result_filter.setCurrentText("Başarılı")
     studio.refresh_results()
     assert studio.results_table.rowCount() == 1
     captured = {}
@@ -1068,7 +1162,7 @@ def test_historical_export_keeps_input_columns_first_seen_later(tmp_path, monkey
                         lambda *_args: (str(tmp_path / "all.csv"), "CSV (*.csv)"))
     captured = {}
 
-    def writer(rows, _path, input_ids):
+    def writer(rows, _path, input_ids, **options):
         captured["input_ids"] = list(input_ids)
         captured["rows"] = list(rows)
         return 33_075
@@ -1689,11 +1783,13 @@ def test_running_workers_cannot_be_started_again(tmp_path):
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     studio = StudioWindow(Store(tmp_path / "already-running.db"))
     studio.driver = object()
-    studio.supervisor = type("Running", (), {"running": True})()
+    studio.supervisor = type("Running", (), {
+        "running": True, "stop": lambda self: setattr(self, "running", False)})()
     studio.start_workers()
     assert "zaten çalışıyor" in studio.worker_status.text()
     studio.worker_timer.stop()
     studio.window.close()
+    assert not studio.supervisor.running
 
 
 def test_strategy_picker_uses_name_symbol_timeframe_not_target_id(tmp_path, monkeypatch):
@@ -1773,7 +1869,7 @@ def test_strategy_picker_rejects_unreadable_chart_context(tmp_path, monkeypatch,
     assert studio.strategy_picker.count() == 1
     assert studio.strategy_picker.currentData() is None
     assert studio.study_id.text() == ""
-    assert not studio.enqueue_plan_button.isEnabled()
+    assert studio.enqueue_plan_button.isEnabled()  # Preparation can retry; direct queue binding remains absent.
     assert "sembol/zaman dilimi okunamadı" in studio.plan_status.text()
     studio.worker_timer.stop()
     studio.window.close()
@@ -1825,13 +1921,14 @@ def test_result_detail_labels_closed_trade_curve_as_reconstruction(tmp_path, mon
     monkeypatch.setattr(studio.store, "results", lambda *_args: [row])
     studio.open_result_details_by_id(11)
     tabs = studio.result_detail_dock.findChild(QtWidgets.QTabWidget)
-    assert tabs.tabText(0) == "Kapanış eğrisi"
-    chart = tabs.widget(0).findChild(CurveChart)
+    assert tabs.tabText(0) == "Preset ve ayarlar"
+    assert tabs.tabText(1) == "Kapanış eğrisi"
+    chart = tabs.widget(1).findChild(CurveChart)
     assert len(chart.points) == 2
     assert chart.closed_trade_only
     assert chart._area().left() >= 106
     assert "Kapanmış işlem" in chart.accessibleName()
-    labels = tabs.widget(0).findChildren(QtWidgets.QLabel)
+    labels = tabs.widget(1).findChildren(QtWidgets.QLabel)
     assert any("Açık pozisyonu" in label.text() for label in labels)
     studio.worker_timer.stop()
     studio.window.close()

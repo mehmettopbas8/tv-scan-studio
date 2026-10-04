@@ -27,7 +27,7 @@ def iter_successful_research_records(catalog: dict[str, Any]):
         metrics = record["heavy_metrics"]
         yield {
             "task_id": index, "task_key": record["id"], "status": "done",
-            "classification": "ağır maliyet başarılı", "verified": True,
+            "classification": "ağır maliyet başarılı", "verified": not catalog.get("imported_unverified", False),
             "error": "", "attempts": 1, "started_at": None, "finished_at": None,
             "payload": {
                 "symbol": record["symbol"], "timeframe": str(record["chart_tf"]),
@@ -188,6 +188,48 @@ def build_catalog(raw_path: Path, normal_summary_path: Path,
              "scope": "Sağlayıcı kontrolünden sonra en az dört hafta ve preset başına 30 yeni bağımsız işlem."},
         ],
     }
+
+
+def read_imported_catalog(path: Path) -> dict[str, Any]:
+    """Validate data-only archives before persisting them; import is not verification."""
+    if path.stat().st_size > 5_000_000:
+        raise ValueError("Katalog 5 MB sınırını aşamaz.")
+    catalog = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        assert isinstance(catalog, dict)
+        for key in ("mapping_source_sha256", "source_sha256", "strategy_title", "criteria", "records", "next_scans", "session_tests", "heavy_tests"):
+            assert key in catalog
+        assert isinstance(catalog["records"], list) and 0 < len(catalog["records"]) <= 1000
+        assert isinstance(catalog["criteria"], dict)
+        for key in ("planned", "valid", "moderate_passes"):
+            assert isinstance(catalog["session_tests"][key], (int, float))
+        assert isinstance(catalog["heavy_tests"]["passes"], (int, float))
+        ids = set()
+        for record in catalog["records"]:
+            for key in ("id", "preset_id", "variant", "candidate", "symbol", "chart_tf", "fvg_tf", "params", "input_titles", "changed_inputs", "period", "period_label", "coverage_days", "cost", "evidence", "moderate_metrics", "heavy_metrics"):
+                assert key in record
+            assert isinstance(record["id"], str) and record["id"] not in ids
+            ids.add(record["id"])
+            assert isinstance(record["params"], dict) and isinstance(record["input_titles"], dict)
+            for metrics in (record["moderate_metrics"], record["heavy_metrics"]):
+                for key in ("trades", "pf", "dd", "net", "net_pct", "win"):
+                    assert isinstance(metrics[key], (int, float))
+            for item in record["changed_inputs"]:
+                for key in ("id", "title", "value"):
+                    assert key in item
+            record["period"]["dateRange"]["backtest"]["from"]
+            record["period"]["dateRange"]["backtest"]["to"]
+            record["cost"]["commission_pct"]
+            record["cost"]["combined_spread_slippage_ticks"]
+            record["evidence"]["alternative_provider"]
+            record["evidence"]["forward"]
+        for scan in catalog["next_scans"]:
+            assert "priority" in scan and "name" in scan
+    except (AssertionError, KeyError, TypeError) as error:
+        raise ValueError("Katalog yapısı eksik veya geçersiz.") from error
+    catalog["available"] = True
+    catalog["imported_unverified"] = True
+    return catalog
 
 
 def load_catalog() -> dict[str, Any]:

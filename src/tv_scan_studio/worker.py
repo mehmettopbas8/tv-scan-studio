@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import math
 import re
@@ -25,8 +25,10 @@ class ScanWorker:
     study_id_override: str | None = None
     target_guard: Callable[[str], None] | None = None
     download_directory: Path | None = None
+    last_completed: bool = field(default=False, init=False)
 
     def run_one(self) -> bool:
+        self.last_completed = False
         # A moved/closed layout must not consume a queued task or retry budget.
         if self.target_guard is not None:
             self.target_guard(self.target_id)
@@ -123,10 +125,15 @@ class ScanWorker:
                     "target_id": self.target_id, "study_id": study_id,
                     "report_source": "deep_xlsx", "deep_sha256": capture.report.sha256,
                     "chart_timezone": capture.chart_timezone,
+                    "symbol_identity": capture.symbol_identity,
                     "verified_changed_inputs": capture.verified_changed_inputs,
                     "cost_verification_scope": "strategy_properties_ui_and_xlsx_spread_unverified",
                 }
             else:
+                refresh_report = getattr(self.driver, "refresh_chart_report", None)
+                if callable(refresh_report):
+                    refresh_report(self.target_id, study_id)
+                    expected["require_fresh_report"] = True
                 result = wait_for_verified_result(
                     self.driver, self.target_id, study_id, expected,
                     timeout=float(payload.get("timeout", 75)),
@@ -137,6 +144,8 @@ class ScanWorker:
                 trades = result.trades
                 evidence = {
                     "symbol": result.symbol, "timeframe": result.timeframe,
+                    "symbol_identity": result.symbol_identity,
+                    "report_fresh": result.report_fresh,
                     "inputs": result.inputs, "period": result.period,
                     "target_id": self.target_id, "study_id": study_id,
                     "cost_verification_scope": "not_verified",
@@ -182,6 +191,7 @@ class ScanWorker:
                 task.id, self.worker_id, metrics, classification, verified=True,
                 evidence=evidence,
             )
+            self.last_completed = True
         except VerificationMismatch as exc:
             if task.attempts >= 3:
                 snapshot = exc.snapshot

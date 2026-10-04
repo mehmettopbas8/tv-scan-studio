@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
+import re
 import shutil
 import zipfile
 from pathlib import Path
 
 
 PRIVATE_RESEARCH_FILES = {"ftmo_session_20260923.json", "ftmo_overnight_33075.jsonl.gz"}
+
+
+def release_version() -> str:
+    """Read package version without importing the UI or installed metadata."""
+    source = Path(__file__).resolve().parents[1] / "src/tv_scan_studio/__init__.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__version__"
+            for target in statement.targets
+        ):
+            value = ast.literal_eval(statement.value)
+            if isinstance(value, str) and re.fullmatch(r"\d+\.\d+\.\d+(?:-(?:rc|beta|alpha)\.\d+)?", value):
+                return value
+    raise ValueError("Paket sürümü geçerli bir yayın sürümü olmalıdır.")
 
 
 def build_release(source: Path, output_dir: Path, version: str) -> tuple[Path, Path, str]:
@@ -54,11 +71,17 @@ def build_release(source: Path, output_dir: Path, version: str) -> tuple[Path, P
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Taşınabilir sürüm ZIP ve SHA-256 üretir.")
-    parser.add_argument("source", type=Path)
+    parser.add_argument("source", type=Path, nargs="?")
     parser.add_argument("--output", type=Path, default=Path("output"))
-    parser.add_argument("--version", default="0.2.0")
+    parser.add_argument("--version", default=None, help="Override only for historical packaging")
+    parser.add_argument("--print-version", action="store_true")
     args = parser.parse_args()
-    archive, checksum_file, checksum = build_release(args.source, args.output, args.version)
+    if args.print_version:
+        print(release_version())
+        return 0
+    if args.source is None:
+        parser.error("source gerekli")
+    archive, checksum_file, checksum = build_release(args.source, args.output, args.version or release_version())
     print(archive.resolve())
     print(checksum_file.resolve())
     print(checksum)

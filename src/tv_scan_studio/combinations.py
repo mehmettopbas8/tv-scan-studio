@@ -6,6 +6,8 @@ from itertools import product
 from math import prod
 from typing import Any, Iterable, Iterator
 
+from .scan_values import parse_scan_values
+
 
 def combination_count(values: dict[str, list[Any]]) -> int:
     return prod(len(items) for items in values.values()) if values else 1
@@ -22,9 +24,9 @@ def numeric_range(start: float, stop: float, step: float) -> list[float]:
         raise ValueError("Adım sıfırdan büyük olmalıdır.")
     if stop < start:
         raise ValueError("Bitiş başlangıçtan küçük olamaz.")
-    count = int(round((stop - start) / step))
-    result = [round(start + index * step, 10) for index in range(count + 1)]
-    if result[-1] < stop and stop - result[-1] > 1e-9:
+    result = parse_scan_values({"start": start, "stop": stop, "step": step})
+    # This helper includes the endpoint, even when the final interval is shorter.
+    if result[-1] < stop:
         result.append(stop)
     return result
 

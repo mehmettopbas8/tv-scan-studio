@@ -24,8 +24,7 @@ def test_worker_layouts_must_have_distinct_saved_chart_ids():
     assert worker_layout_candidates(targets, names) == {
         "worker-1": "Unique1", "worker-2": "Unique2"}
     targets[2]["url"] = targets[1]["url"]
-    with pytest.raises(ValueError, match="benzersiz"):
-        worker_layout_candidates(targets, names)
+    assert worker_layout_candidates(targets, names) == {}
     targets[2]["url"] = "https://www.tradingview.com/chart/Unique2/"
     names["worker-2"] = "Coding"
     assert worker_layout_candidates(targets, names) == {"worker-1": "Unique1"}

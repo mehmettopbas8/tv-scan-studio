@@ -20,7 +20,7 @@ from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .pine import parse_strategy_inputs
-from .tradingview import chart_resolution
+from .tradingview import chart_resolution, symbol_matches
 
 
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -477,7 +477,8 @@ def verify_deep_export(report: DeepExport, *, symbol: str, timeframe: str,
                        cost_assumptions: dict[str, Any],
                        ui_metrics: dict[str, float | int] | None = None,
                        ui_date_label: str | None = None,
-                       ui_update_pending: bool | None = None) -> tuple[dict[str, Any], ...]:
+                       ui_update_pending: bool | None = None,
+                       symbol_identity: dict[str, Any] | None = None) -> tuple[dict[str, Any], ...]:
     """Verify XLSX identity and trades against the task and live report UI.
 
     This does not by itself verify that the UI/export came from the same guarded
@@ -485,7 +486,8 @@ def verify_deep_export(report: DeepExport, *, symbol: str, timeframe: str,
     """
     if not report.sha256 or report.mtime_ns <= 0:
         raise DeepExportError("XLSX dosya kimliği veya indirme zamanı eksik.")
-    if report.properties["Symbol"] != symbol:
+    if (report.properties["Symbol"] != symbol and
+            not (":" in symbol and symbol_matches(symbol, report.properties["Symbol"], symbol_identity))):
         raise DeepExportError("TradingView XLSX sembolü görevle eşleşmiyor.")
     expected_tf = _TIMEFRAME_LABELS.get(chart_resolution(timeframe), "")
     if not expected_tf or report.properties["Timeframe"] != expected_tf:

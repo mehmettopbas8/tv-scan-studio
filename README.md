@@ -4,7 +4,18 @@ TradingView Desktop üzerindeki Pine stratejilerini farklı input, sembol, timef
 
 Projeler, görev kuyruğu, sonuçlar ve doğrulama kayıtları SQLite'ta tutulur. TV Scan Studio hesabı veya bulut servisi gerekmez; uygulamada telemetri yoktur. TradingView'in kendi hesabı, internet bağlantısı, veri ve abonelik koşulları ayrıca geçerlidir.
 
-> Sürüm durumu: `0.2.0` geliştirme / kabul adayıdır. Kaynak testleri ve portable paket kontrolleri, bütün canlı kullanıcı kabulünün tamamlandığı anlamına gelmez. Paketli uygulamada çalışan görevin kesilmesi ve kurtarılması gibi kalan kabul kapıları kapanmadan “MVP tamamlandı” denmez.
+> Sürüm durumu: `0.2.0-rc.2` ön sürüm / kabul adayıdır, kararlı sürüm değildir. Kaynak ve paket testleri bütün canlı kullanıcı kabulünü kanıtlamaz. Üç ekranlı akış, popup rehber, çoklu grafik ve Excel düzeltmeleri bu sürümdedir; planlanan yeni özellikler henüz değildir.
+
+### Bilinen sınırlar ve planlanan işler
+
+- Gerçek kesinti/kurtarma, boş kullanıcıdan uçtan uca tarama, özel tarih ve çoklu grafik performansının yeni pakette görünür kabulü ayrı kapılardır.
+- Durdur eylemi mevcut işi güvenli noktada bitirmeyi bekler; mesaj tek başına bütün workerların bittiğini kanıtlamaz. Grafiği değiştirmeden veya yeniden başlatmadan çalışan işlerin bitmesini kontrol edin.
+- Aynı plan tekrar eklenince mevcut görevler tekilleştirilir. Ayrı tarama koşuları/değişmez geçmiş ve sonuçları yeniden değerlendirme henüz yoktur.
+- Geçersiz plan kaydının ayarları koruması ve hassasiyet karşılaştırmasının kanıt kapıları ayrıca geliştirilecektir. Planı yeniden açarken seçili alanları kontrol edin; geçersiz sonuçları dayanıklılık kanıtı saymayın.
+- Yedekler şu anda DB ve Pine kaynaklarını kapsar. Dış araştırma arşivlerini, raporları ve görüntüleri ayrıca saklayın; bütün geçmiş araştırmaların aktarılmış olduğu varsayılmaz.
+- Örnekleme/bütçe, kaba→ince arama, ayarlar arası kısıtlar, ayrı dönem doğrulaması, kapsamlı yardım ve destek paketi planlanmıştır; bu release'te kullanılabilir değildir.
+
+Tam taramada 500 gibi zorunlu bir kombinasyon sınırı yoktur. Paralel grafik seçimi 1–16 aralığındadır; daha fazla grafik tek başına daha yüksek test/saat garantisi değildir.
 
 ## İçindekiler
 
@@ -38,8 +49,8 @@ Kurulum sihirbazı yoktur: **indir → doğrula → EXE'ye çift tıkla**. Pytho
 **Yayımlanmış sürüm varsa — önerilen yol:**
 
 1. [GitHub Releases](https://github.com/mehmettopbas8/tv-scan-studio/releases) sayfasını açın ve istediğiniz sürüme girin. Ön sürüm / release candidate etiketi varsa bunu kararlı sürümle karıştırmayın.
-2. Sürümün `Assets` bölümünde `TV-Scan-Studio-0.2.0.exe` ve `TV-Scan-Studio-0.2.0.exe.sha256` dosyalarına tıklayıp ikisini de indirin. Sürüm numarası farklı olabilir; EXE ve checksum aynı sürüme ait olmalı.
-3. ZIP'i tercih ederseniz `TV-Scan-Studio-0.2.0-portable.zip` ve onun `.zip.sha256` dosyasını indirin. Önce ZIP'i aşağıdaki yöntemle doğrulayın, sonra Windows'ta sağ tık → `Tümünü ayıkla` ile içindeki tek EXE'yi çıkarın. ZIP'in içinden doğrudan çalıştırmayın.
+2. Sürümün `Assets` bölümünde `TV-Scan-Studio-0.2.0-rc.2.exe` ve `TV-Scan-Studio-0.2.0-rc.2.exe.sha256` dosyalarına tıklayıp ikisini de indirin. Sürüm numarası farklı olabilir; EXE ve checksum aynı sürüme ait olmalı.
+3. ZIP'i tercih ederseniz `TV-Scan-Studio-0.2.0-rc.2-portable.zip` ve onun `.zip.sha256` dosyasını indirin. Önce ZIP'i aşağıdaki yöntemle doğrulayın, sonra Windows'ta sağ tık → `Tümünü ayıkla` ile içindeki tek EXE'yi çıkarın. ZIP'in içinden doğrudan çalıştırmayın.
 
 **Henüz Release yoksa — mevcut geliştirme paketi:**
 
@@ -56,14 +67,14 @@ Releases sayfasında paket yoksa yukarıdaki Actions yolu kullanılabilir. Bir E
 EXE ve ona ait checksum'u aynı klasöre koyun. Dosya Gezgini'nde bu klasörü açın, adres çubuğuna `powershell` yazıp Enter'a basın. Aşağıdaki komutta dosya adını indirdiğiniz sürüme göre değiştirin:
 
 ```powershell
-$fileToCheck = ".\TV-Scan-Studio-0.2.0.exe"
+$fileToCheck = ".\TV-Scan-Studio-0.2.0-rc.2.exe"
 $expected = (Get-Content "$fileToCheck.sha256").Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
 $actual = (Get-FileHash -LiteralPath $fileToCheck -Algorithm SHA256).Hash
 if ($actual -ne $expected) { throw "SHA-256 eşleşmiyor. Dosyayı çalıştırmayın." }
 Write-Host "SHA-256 doğrulandı."
 ```
 
-ZIP doğrularken yalnız ilk satırı `$fileToCheck = ".\TV-Scan-Studio-0.2.0-portable.zip"` olarak değiştirin; yanında aynı adlı `.zip.sha256` bulunmalı. Checksum dosyası çalışma bağımlılığı değildir, dosya bütünlüğü kontrolü içindir. Checksum'u da aynı güvenilir kaynaktan indirin; hash eşleşmesi yayıncı kimliği veya zararlı yazılım taraması yerine geçmez.
+ZIP doğrularken yalnız ilk satırı `$fileToCheck = ".\TV-Scan-Studio-0.2.0-rc.2-portable.zip"` olarak değiştirin; yanında aynı adlı `.zip.sha256` bulunmalı. Checksum dosyası çalışma bağımlılığı değildir, dosya bütünlüğü kontrolü içindir. Checksum'u da aynı güvenilir kaynaktan indirin; hash eşleşmesi yayıncı kimliği veya zararlı yazılım taraması yerine geçmez.
 
 #### 3. İlk açılış
 
@@ -109,13 +120,13 @@ Uygulama tek masaüstü örneğiyle çalışır. İkinci başlatma, mevcut taram
 
 ## İlk tarama
 
-1. **Yeni proje:** Projeye bir ad verin, Pine strateji kodunu yapıştırın, `Inputları analiz et` ile bulunan alanları inceleyin ve projeyi kaydedin.
-2. **Tarama ayarları:** Projeyi, sembolleri, timeframe'leri, tarih aralığını, başarı kriterlerini ve maliyetleri seçin.
-3. **Input kararı:** Varsayılanlar sabit kalır. Taramak istediğiniz inputta `Tara` seçin; önerilen değerleri gerekirse başlangıç/bitiş/adım veya seçenek listesiyle değiştirin. `Sabit bırak` tek değeri korur, `Hariç tut` tarama değişikliğinden çıkarır; Pine kaynağından input silmez.
-4. **Plan önizlemesi:** Kombinasyon sayısını hesaplayıp kontrol edin, ardından görevleri kuyruğa ekleyin. Örneğin 3 input değeri × 2 sembol × 2 timeframe = 12 görev. Birden çok bağımsız inputun değer sayıları da çarpılır; kontrollü varyantlar ilişkili ayarları eşlenmiş durumlar halinde tutabilir.
-5. **Worker dağıtımı:** TradingView bağlantısını kontrol edin. Her workerı ayrı kayıtlı layouta, doğru stratejiye ve istediğiniz projeye bağlayın. Stratejiyi görünen adıyla seçin; teknik Strategy ID'yi kullanıcı olarak bulmanız gerekmez.
-6. **Başlatma:** Önizlemede strateji, görev sayısı ve worker atamalarını doğrulayıp `Taramayı başlat` düğmesine basın.
-7. **Takip:** Tarama masasında ilerlemeyi; sonuç ekranında doğrulama, kriterler ve hataları inceleyin. Gerektiğinde workerı durdurun veya hatalı görevleri yeniden sıraya alın.
+1. **Stratejiler:** Pine strateji kodunu yapıştırın; ayarlar otomatik analiz edilir. Adını kontrol edip `Stratejiyi kaydet` seçin. Aynı kaynak ikinci proje oluşturmaz; açıkça kopya oluşturabilirsiniz. Ardından `Taramayı hazırla` ile ilerleyin.
+2. **Tarama:** Sembol ve zaman dilimini yanlarındaki `Seç` düğmeleriyle ekleyin. Tarih aralığı isteğe bağlıdır; boşsa erişilebilen geçmiş kullanılır. Bir ayarda `Farklı değerleri dene`, diğerlerinde `Sabit tut` seçin. Fast EMA 7/8/9, bir sembol ve bir zaman dilimi için üç test üretir.
+3. **Paralellik ve özet:** `Paralel tarama grafiği` sayısını 1–16 arasında seçin; kayıtlı tercih korunur. Birden fazla bağımsız inputun değer sayıları çarpılır. Maliyetler, başarı ölçütleri ve session seçenekleri gelişmiş ayarlardadır.
+4. **Hazırlık ve onay:** `Hazırla ve başlat` bağlantıyı kontrol eder, ayrı kayıtlı grafiği hazırlar ve kaynak kimliğini doğrular. Değişiklik özetini onaylayınca görevler kuyruğa alınır ve tarama başlar. Otomatik hazırlık desteklenmezse sınırlı rehberi izleyin; kişisel grafikler otomatik atanmaz.
+5. **Sonuçlar:** Tamamlanan test sayısı, doğrulama, hatalar ve ölçülen test/saat gösterilir. Filtreleyin, sonucu seçerek ayrıntıları açın veya kapsamını seçerek dışa aktarın. `Görevler ve yedekleme` ile görev durumları ve yedek işlemlerine ulaşın. Genel ayarlar sol alttaki `Ayarlar` düğmesindedir.
+
+Her ana ekranda ilk kullanım popup rehberi bulunur; `Geri`, `İleri`, `Turu atla` ve son adımda `Anladım, bitir` ile kullanılır. Ekranın yardım düğmesi turu yeniden açar. Rehber sizin yerinize kayıt yapmaz veya tarama başlatmaz. Henüz her kontrol için kapsamlı tooltip/F1 desteği yoktur. Kaydırmak kapalı seçimlerin değerini değiştirmez.
 
 Input aralığı önerileri başlangıç önerisidir, kârlılık veya optimum ayar kanıtı değildir. Kaynakta tanımı dışında kullanılmayan input başlangıçta dışlanabilir; kullanıcı geri alabilir. Aynı koşullarda en az üç doğrulanmış değerin aynı sonucu vermesi yalnız “etkisiz olabilir” uyarısıdır, kesin etkisizlik kanıtı veya otomatik dışlama değildir.
 
@@ -166,6 +177,8 @@ FTMO gün içi equity ihlali yalnız kapanmış işlemlerden kanıtlanamaz. İş
 
 Özel araştırma kataloğu ve tarihsel arşiv açık kaynak/portable pakete dahil değildir. Temiz kurulumda araştırma ekranı veri eksikliğini açıklar; yeni proje oluşturma ve tarama için bu arşivlere ihtiyaç yoktur. Alternatif sağlayıcı görevi hazırlamak workerı kendiliğinden başlatmaz.
 
+Excel için `.xlsx` tercih edin; hücreler sayı olarak korunur ve okunabilir sütun genişlikleri kullanılır. `Türkçe Excel CSV` UTF-8 BOM, noktalı virgül ayırıcı ve ondalık virgül kullanır. Excel ayırıcıyı otomatik tanımazsa `Veri → Metin/CSV'den` ile UTF-8 ve `;` seçin. `Standart CSV` virgül ayırıcı ve standart sayısal metin içindir.
+
 ## Veriler ve yedekleme
 
 Varsayılan veritabanı:
@@ -179,6 +192,7 @@ Projeler, Pine kaynakları, ayarlar, görevler, sonuçlar ve olay kayıtları ye
 - `Yedek oluştur`: SQLite anlık görüntüsü, Pine kaynakları ve dosya checksum'larını içeren yedek üretir. Açık veritabanını elle kopyalamak yerine bu yolu tercih edin.
 - `Yedeği yeni dosyaya aç`: Önce yedek ZIP'ini, sonra **yeni** `.db` konumunu seçtirir. Checksum, SQLite bütünlüğü, ilişkiler ve Pine kaynak tutarlılığı kontrol edilir. Var olan dosyanın üzerine yazılmaz.
 - Geri yükleme **açık uygulamanın aktif veritabanını değiştirmez**, yeni dosyaya otomatik geçmez. Bu eylem yedeği güvenli ayrı dosyaya çıkarmaktır; aktif veri değiştirme sihirbazı değildir.
+- Dış araştırma arşivleri, indirilen raporlar ve görüntüler bu yedeğin içinde değildir; başka bilgisayara geçerken ayrıca taşıyın.
 - Normal uygulama başlangıcında yarım kalan işler yeniden bekleme kuyruğuna alınır. Kaynak testlerindeki kurtarma kanıtı, paketli uygulamadaki gerçek kesinti kabulünün yerine geçmez.
 
 Yeni sürüme geçmeden önce yedek alın. Veritabanını, TradingView oturum bilgilerini veya özel araştırma arşivlerini dağıtım paketine koymayın.
@@ -267,6 +281,8 @@ Remove-Item Env:\QT_QPA_PLATFORM
 
 ```powershell
 $exe = (Resolve-Path ".\dist\TV-Scan-Studio.exe").Path
+$process = Start-Process -FilePath $exe -ArgumentList "--helper-self-test" -Wait -PassThru -WindowStyle Hidden
+if ($process.ExitCode -ne 0) { throw "Portable yardımcı işlem testi başarısız." }
 $process = Start-Process -FilePath $exe -ArgumentList "--self-test" -Wait -PassThru -WindowStyle Hidden
 if ($process.ExitCode -ne 0) { throw "Portable self-test başarısız." }
 $process = Start-Process -FilePath $exe -ArgumentList "--ui-smoke-test" -Wait -PassThru -WindowStyle Hidden
@@ -295,7 +311,8 @@ Windows'ta, geliştirme bağımlılıkları kurulduktan sonra proje kökünde:
 
 ```powershell
 .\.venv\Scripts\pyinstaller.exe --noconfirm --clean TVScanStudio.spec
-.\.venv\Scripts\python.exe tools\build_release.py dist\TV-Scan-Studio.exe --output dist --version 0.2.0
+.\.venv\Scripts\python.exe tools\build_release.py --print-version
+.\.venv\Scripts\python.exe tools\build_release.py dist\TV-Scan-Studio.exe --output dist
 ```
 
 Çıktılar:
@@ -303,10 +320,10 @@ Windows'ta, geliştirme bağımlılıkları kurulduktan sonra proje kökünde:
 ```text
 dist/
 ├── TV-Scan-Studio.exe               Tek dosyalı build çıktısı
-├── TV-Scan-Studio-0.2.0.exe          Doğrudan dağıtılabilir tek EXE
-├── TV-Scan-Studio-0.2.0.exe.sha256
-├── TV-Scan-Studio-0.2.0-portable.zip
-└── TV-Scan-Studio-0.2.0-portable.zip.sha256
+├── TV-Scan-Studio-0.2.0-rc.2.exe     Doğrudan dağıtılabilir tek EXE
+├── TV-Scan-Studio-0.2.0-rc.2.exe.sha256
+├── TV-Scan-Studio-0.2.0-rc.2-portable.zip
+└── TV-Scan-Studio-0.2.0-rc.2-portable.zip.sha256
 ```
 
 Paketleme komutları aynı adlı eski build/ZIP çıktılarını yenileyebilir; kişisel verinizi bu çıktı dizinlerinde tutmayın. `build_release.py` uygulama dosyasını kontrol eder ve yerel veritabanı, belirli gizli/kişisel çıktı dosyaları ile özel araştırma arşivleri bulunan paketi reddeder. Bu kontrol, bütün gizli veriler için genel amaçlı tarayıcı değildir; dağıtım içeriğini ayrıca inceleyin.

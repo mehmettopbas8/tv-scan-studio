@@ -23,6 +23,8 @@ def parse_scan_values(value: Any) -> list[Any] | None:
         step = Decimal(str(value["step"]))
     except InvalidOperation as exc:
         raise ValueError("Aralık değerleri sayı olmalıdır.") from exc
+    if not all(item.is_finite() for item in (start, stop, step)):
+        raise ValueError("Aralık değerleri sonlu sayı olmalıdır.")
     if step == 0:
         raise ValueError("Aralık adımı sıfır olamaz.")
     if (stop - start) * step < 0:

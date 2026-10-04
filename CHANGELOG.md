@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.2.0 — release candidate, not yet published
+## 0.2.0-rc.2 — preview
+
+- Three primary screens: Strategies, Scan and Results; general settings and task/backup tools remain accessible.
+- Anchored first-use popup tours, source deduplication and explicit copy creation, readable input names, symbol/timeframe selection and wheel-safe controls.
+- Guarded automatic preparation of independent saved test charts, source identity checks, connection guidance and hidden helper failure containment. Personal charts are not assigned automatically.
+- Restore multi-graph selection (1–16), measured tests/hour, saved presets, optional local research imports, result filters and explicit export scopes.
+- Excel defaults for archive exports, readable XLSX widths and Turkish UTF-8 CSV with semicolon separators and localized typed scalars.
+- Count only verified completions, not retry attempts, in worker throughput; prevent numeric-range endpoint overshoot and reject non-finite range fields.
+- Release metadata, tags and package names now derive from the package version; Windows CI checks the hidden helper as well as self/UI probes.
+
+This is an unsigned prerelease. Packaged interruption/recovery, empty-user live acceptance, date coverage, clean-Windows behavior and multi-worker performance remain separate acceptance gates. External research/report files are not included in current DB/Pine backups. Immutable scan runs, reevaluation, full contextual help, optional sampling, constraints and separate-period research are planned, not shipped here. See README for known limitations.
+
+## 0.2.0-rc.1 — preview
 
 - Move the packaging launcher under tools/ and add step-by-step EXE download, verification, first-run, update and removal instructions, including the development Actions artifact path before a Release exists.
 - Package Windows builds as a single self-contained EXE; publish direct EXE/checksum and an optional one-EXE ZIP, without an adjacent `_internal` folder. Runtime extraction uses the Windows temporary directory; persistent user data stays in AppData.

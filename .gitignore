@@ -30,6 +30,14 @@ docs/ADR-001-python-pyside6.md
 docs/IMPLEMENTATION_STATUS.md
 docs/ALGOGRAPH_UI_AND_COMPLETION_PLAN.md
 docs/ORIGINAL_MVP_ACCEPTANCE_AUDIT.md
+docs/ux-redesign-tracker.md
+LocalLow/
+output-local-*.png
+tools/audit_additional_gaps.py
+tools/audit_legacy_transfer.py
+tools/layout_preparation_probe.py
+tools/redesign_preview.py
+tools/validate_excel_locale.py
 tools/inspect_*.py
 tools/close_worker3_*.py
 tools/open_worker3_*.py

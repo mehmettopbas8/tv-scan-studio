@@ -18,7 +18,7 @@ a = Analysis(
     ["tools/run_tv_scan_studio.py"],
     pathex=["src"],
     binaries=msvc_runtime,
-    datas=reportlab_data + tzdata_data,
+    datas=reportlab_data + tzdata_data + [("src/tv_scan_studio/assets/app-icon.ico", "tv_scan_studio/assets")],
     hiddenimports=["PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "websocket"],
     hookspath=[],
     runtime_hooks=[],
@@ -42,4 +42,5 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon="src/tv_scan_studio/assets/app-icon.ico",
 )

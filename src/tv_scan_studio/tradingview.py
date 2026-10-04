@@ -54,6 +54,8 @@ class StrategySnapshot:
     period: dict[str, Any] | None
     trades: tuple[dict[str, Any], ...] = ()
     report_source: str = "chart"
+    symbol_identity: dict[str, Any] | None = None
+    report_fresh: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +112,99 @@ class GncZihinDriver:
         if not isinstance(label, str) or "Active layout:" not in label:
             return ""
         return label.split("Active layout:", 1)[1].strip().splitlines()[0]
+
+    def create_empty_layout(self, target_id: str, name: str) -> None:
+        """Use Create layout with Open in new tab; do not detach or rename a chart."""
+        if not re.fullmatch(r"TV Scan Worker [1-9]\d*", name):
+            raise TradingViewError("Tarama grafiği adı doğrulanamadı.")
+        self._motor._eval(target_id,
+            "window.TradingViewApi._saveChartService.createEmptyChart(); true")
+        expression = r'''(async()=>{
+          const until=Date.now()+8000;let input;
+          while(Date.now()<until){
+            const fields=[...document.querySelectorAll('input[placeholder="My layout"]')]
+              .filter(x=>x.offsetParent!==null);
+            if(fields.length===1){input=fields[0];break;}
+            await new Promise(r=>setTimeout(r,100));
+          }
+          if(!input)throw Error('Create layout is unavailable or requires account action');
+          let dialog=input;
+          for(let n=0;n<12&&dialog&&!dialog.innerText.includes('Create layout');n++)dialog=dialog.parentElement;
+          if(!dialog||dialog.innerText.length>3000||!dialog.innerText.includes('Create layout'))throw Error('Unexpected layout dialog');
+          const check=dialog.querySelector('input[type="checkbox"]');
+          if(!check)throw Error('New tab option was not found');
+          if(!check.checked)check.click();
+          if(!check.checked)throw Error('Open in new tab was not enabled');
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,NAME);
+          input.dispatchEvent(new Event('input',{bubbles:true}));
+          input.dispatchEvent(new Event('change',{bubbles:true}));
+          await new Promise(r=>setTimeout(r,200));
+          const buttons=[...dialog.querySelectorAll('button')].filter(x=>x.innerText==='Create');
+          if(buttons.length!==1||buttons[0].disabled||input.value!==NAME)throw Error('Create layout action unavailable');
+          buttons[0].click();return true;
+        })()'''.replace("NAME", json.dumps(name))
+        if self._motor._eval(target_id, expression, await_promise=True) is not True:
+            raise TradingViewError("Yeni layout isteği doğrulanamadı.")
+
+    def load_private_source(self, target_id: str, source: str, *, journal: dict,
+                            persist: Callable[[dict], None], guard: Callable[[str], None]) -> dict:
+        """Save a separate private script once, then attach only to an owned chart.
+
+        Ambiguous save failures require review rather than silently creating a
+        duplicate. Existing studies and existing private scripts are not edited.
+        """
+        expected = pine_source_hash(source)
+        guard(target_id)
+        existing = self.strategies(target_id)
+        if existing:
+            if len(existing) == 1 and self.saved_strategy_source_hash(target_id, existing[0]["id"]) == expected:
+                return existing[0]
+            raise TradingViewError("Tarama grafiğinde farklı bir strateji var; mevcut kaynak değiştirilmedi.")
+        if journal.get("source_hash") not in (None, expected):
+            raise TradingViewError("Hazırlık kaynağı değişmiş; önceki özel script korunuyor.")
+        pine_id = journal.get("pine_id")
+        version = journal.get("version")
+        if not pine_id:
+            if journal.get("save_requested"):
+                raise TradingViewError("Önceki özel script kaydı tamamlanmış olabilir. Kayıt incelenmeden yeni bir kopya oluşturulmadı.")
+            journal.update(source_hash=expected, save_requested=True)
+            persist(dict(journal))
+            guard(target_id)
+            saved = self._motor._eval(target_id,
+                "TradingViewApi._pineEditorApi.saveNewScript(" + json.dumps({
+                    "source": source, "name": "TV Scan Source " + expected[:20]}) + ")",
+                await_promise=True)
+            meta = saved.get("metaInfo", {}) if isinstance(saved, dict) else {}
+            pine_id, version = meta.get("scriptIdPart"), meta.get("pine", {}).get("version")
+            if not saved or not saved.get("success") or not pine_id or not version:
+                raise TradingViewError("Ayrı özel script kaydedilemedi. TradingView hesabını ve derleme hatalarını kontrol edin.")
+            journal.update(pine_id=pine_id, version=str(version))
+            persist(dict(journal))
+        guard(target_id)
+        expression = r'''(async()=>{
+          const saved=await TradingViewApi._pineEditorApi.getSource(PINE_ID,VERSION);
+          if(typeof saved?.source!=='string'||String(saved.version)!==VERSION)return null;
+          return saved.source;
+        })()'''.replace("PINE_ID", json.dumps(pine_id)).replace("VERSION", json.dumps(str(version)))
+        saved_source = self._motor._eval(target_id, expression, await_promise=True)
+        if not isinstance(saved_source, str) or pine_source_hash(saved_source) != expected:
+            raise TradingViewError("Ayrı özel script kaynağı kayıtlı stratejiyle farklı; grafiğe eklenmedi.")
+        guard(target_id)
+        if self.strategies(target_id):
+            raise TradingViewError("Hazırlık sırasında grafik değişti; strateji eklenmedi.")
+        descriptor = {"type": "pine", "pineId": pine_id, "pineVersion": str(version)}
+        self._motor._eval(target_id,
+            "TradingViewApi._activeChartWidgetWV.value().createStudy(" + json.dumps(descriptor) + ")",
+            await_promise=True)
+        guard(target_id)
+        applied = self.strategies(target_id)
+        if (len(applied) != 1 or applied[0].get("pine_id") != pine_id
+                or str(applied[0].get("pine_version")) != str(version)
+                or self.saved_strategy_source_hash(target_id, applied[0]["id"]) != expected):
+            raise TradingViewError("Yüklenen stratejinin tam kaynak kimliği doğrulanamadı; tarama başlatılmadı.")
+        journal["study_id"] = applied[0]["id"]
+        persist(dict(journal))
+        return applied[0]
 
     def replay_active(self, target_id: str) -> bool:
         """Read-only Replay preflight; unknown UI state must not permit chart mutation."""
@@ -337,6 +432,36 @@ class GncZihinDriver:
             raise SourceReadUnavailable("Bağlı stratejinin tam Pine kaynağı okunamadı; kaynak eşleşmesi doğrulanmadı.")
         return pine_source_hash(data["source"])
 
+    def saved_strategy_source_hash(self, target_id: str, study_id: str) -> str:
+        """Read saved source for the exact applied ID/version without opening an editor.
+
+        Recheck the applied build after the asynchronous source request. A
+        switched strategy, missing digest or ambiguous study is not evidence.
+        """
+        data = self._motor._eval(target_id, r'''(async()=>{
+          const identity=()=>{
+            const c=TradingViewApi._activeChartWidgetWV.value();
+            const matches=c._chartWidget.model().dataSources().filter(x=>
+              x.id()===STUDY_ID&&typeof x.reportData==='function');
+            if(matches.length!==1)return null;
+            const meta=matches[0].metaInfo?.();
+            const id=c.getStudyById(STUDY_ID)?.getInputValues?.()
+              ?.find(v=>v.id==='pineId')?.value;
+            if(!id||!meta?.pine?.version||!meta.pine.digest)return null;
+            return {id,version:String(meta.pine.version),digest:meta.pine.digest};
+          };
+          const before=identity();if(!before)return null;
+          const saved=await TradingViewApi._pineEditorApi.getSource(before.id,before.version);
+          const after=identity();
+          if(!after||JSON.stringify(before)!==JSON.stringify(after)||
+             typeof saved?.source!=='string'||String(saved.version)!==before.version)return null;
+          return {source:saved.source,pine_id:before.id,version:before.version};
+        })()'''.replace('STUDY_ID', json.dumps(study_id)), await_promise=True)
+        if (not isinstance(data, dict) or not isinstance(data.get("source"), str)
+                or not data["source"] or not data.get("pine_id") or not data.get("version")):
+            raise SourceReadUnavailable("Grafikteki stratejinin kayıtlı kaynağı doğrulanamadı.")
+        return pine_source_hash(data["source"])
+
     def ensure_strategy_source_hash(self, target_id: str, study_id: str,
                                     *, guard: Callable[[str], None]) -> str:
         """Read a bound source, temporarily opening only a closed worker editor."""
@@ -410,14 +535,18 @@ class GncZihinDriver:
     def snapshot(self, target_id: str, study_id: str) -> StrategySnapshot:
         data = self._eval(target_id, study_id, r"""
             const r=s.reportData(),p=r?.performance,a=p?.all;
+            const refresh=globalThis.__tvScanReportRefresh?.get(s.id());
+            const si=c.chartModel?.()?.mainSeries?.()?.symbolInfo?.();
             const scriptIds=new Set((s.metaInfo?.()?.inputs||[])
               .filter(v=>/^in_\d+$/.test(v.id)&&v.groupId!=='strategy_props').map(v=>v.id));
             return {status:s._status?.value?.(),symbol:c.symbol(),tf:String(c.resolution()),
+              symbol_identity:si?{full_name:si.full_name,pro_name:si.pro_name,name:si.name,exchange:si.exchange}:null,
               inputs:c.getStudyById(s.id()).getInputValues().filter(v=>scriptIds.has(v.id)),
               metrics:a?{trades:a.totalTrades,profit_factor:a.profitFactor,
                 win_rate_pct:a.percentProfitable*100,max_drawdown_pct:p.maxStrategyDrawDownPercent*100,
                 net_profit:a.netProfit,net_profit_pct:a.netProfitPercent*100}:null,
-              period:r?.settings||null,trades:Array.isArray(r?.trades)?r.trades:[]};
+              period:r?.settings||null,trades:Array.isArray(r?.trades)?r.trades:[],
+              report_fresh:!!(refresh&&refresh.study===s&&r&&r!==refresh.before&&!s.isRestarting())};
         """)
         status = data.get("status") or {}
         return StrategySnapshot(
@@ -428,7 +557,31 @@ class GncZihinDriver:
             metrics=data.get("metrics"), period=data.get("period"),
             trades=tuple(data.get("trades") or ()),
             report_source="chart",
+            symbol_identity=data.get("symbol_identity"),
+            report_fresh=data.get("report_fresh"),
         )
+
+    def refresh_chart_report(self, target_id: str, study_id: str) -> None:
+        """Recalculate the owned study after all inputs/properties are applied.
+
+        Input echo and Completed status can precede the asynchronous report.
+        Track the actual report object, allowing genuinely identical results
+        while rejecting the old report even if it stays stable for many reads.
+        """
+        if self.target_guard is None:
+            raise TradingViewError("Rapor yenilemesi için bağımsız grafik koruması gerekli.")
+        self.target_guard(target_id)
+        result = self._eval(target_id, study_id, r'''
+            if(typeof s.restart!=='function'||typeof s.isRestarting!=='function')
+              return {error:'report_refresh_unsupported'};
+            globalThis.__tvScanReportRefresh??=new Map();
+            globalThis.__tvScanReportRefresh.set(s.id(),{study:s,before:s.reportData()});
+            s.restart(true);
+            return true;
+        ''')
+        if result is not True:
+            raise TradingViewError("Yeni görev için rapor yenilemesi onaylanmadı.")
+        self.target_guard(target_id)
 
     def configure(self, target_id: str, study_id: str, symbol: str, timeframe: str, inputs: dict[str, Any]) -> None:
         values = [{"id": key, "value": value} for key, value in inputs.items()]
@@ -694,11 +847,21 @@ def confirmed_strategy_identity_matches(strategy: dict[str, Any], identity: dict
     )
 
 
-def symbol_matches(requested: str, observed: str) -> bool:
+def symbol_matches(requested: str, observed: str,
+                   identity: dict[str, Any] | None = None) -> bool:
     requested = requested.strip()
     observed = observed.strip()
     if ":" in requested:
-        return observed == requested
+        if observed == requested:
+            return True
+        # Resolve aliases only from the currently applied series, never by
+        # stripping a provider suffix or comparing tickers across providers.
+        provider, ticker = requested.split(":", 1)
+        return bool(identity and identity.get("full_name") == observed
+                    and identity.get("pro_name") == requested
+                    and identity.get("name") == ticker
+                    and identity.get("exchange") == provider
+                    and observed.rsplit(":", 1)[-1] == ticker)
     return observed == requested or observed.rsplit(":", 1)[-1] == requested
 
 
@@ -760,7 +923,7 @@ def wait_for_verified_result(
         valid = (
             last.status_type == 2
             and last.metrics is not None
-            and symbol_matches(expected["symbol"], last.symbol)
+            and symbol_matches(expected["symbol"], last.symbol, last.symbol_identity)
             and last.timeframe == requested_tf
             and all(
                 key in last.inputs and last.inputs[key] == value
@@ -769,10 +932,14 @@ def wait_for_verified_result(
             )
             and period_matches
             and source_matches
+            and (not expected.get("require_fresh_report") or last.report_fresh is True)
         )
         stable = stable + 1 if valid and state == previous else (1 if valid else 0)
         previous = state
         if stable >= stable_reads:
             return last
         time.sleep(max(0.01, poll_interval))
-    raise VerificationMismatch(f"Sonuç doğrulanamadı; son durum: {last!r}", last)
+    detail = {"symbol": last.symbol, "timeframe": last.timeframe,
+              "status": last.status_type, "inputs": last.inputs,
+              "report_source": last.report_source} if last else None
+    raise VerificationMismatch(f"Sonuç doğrulanamadı; son durum: {detail}", last)

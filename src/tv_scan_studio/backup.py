@@ -28,6 +28,9 @@ def _sha256(path: Path) -> str:
 
 def create_backup(store: Store, destination: str | Path) -> dict[str, Any]:
     destination = Path(destination)
+    protected = (store.path, Path(str(store.path) + "-wal"), Path(str(store.path) + "-shm"))
+    if destination.resolve() in {path.resolve() for path in protected}:
+        raise ValueError("Yedek dosyası aktif veritabanının veya yardımcı dosyalarının üzerine yazılamaz. Ayrı bir ZIP dosyası seçin.")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="tv-scan-backup-") as temp:
         temp_path = Path(temp)

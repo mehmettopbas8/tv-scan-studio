@@ -17,3 +17,15 @@ def test_numeric_range_rejects_invalid_step():
     with pytest.raises(ValueError):
         numeric_range(1, 2, 0)
 
+
+def test_numeric_range_never_exceeds_end():
+    assert numeric_range(0, 1, 0.6) == [0, 0.6, 1]
+    assert numeric_range(0, 1, 2) == [0, 1]
+    assert numeric_range(1, 1, 0.1) == [1]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_numeric_range_rejects_nonfinite_values(value):
+    with pytest.raises(ValueError):
+        numeric_range(0, value, 1)
+

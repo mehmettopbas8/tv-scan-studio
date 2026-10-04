@@ -354,6 +354,28 @@ def test_deep_export_utc_dates_and_ui_metrics_match_live_worker(timeframe):
     assert sum(trade["tp"]["v"] for trade in trades) == pytest.approx(report.metrics["net_profit"])
 
 
+def test_xlsx_provider_alias_requires_exact_current_series_proof():
+    report = summarize_deep_export(tables(), sha256="abc", mtime_ns=123)
+    report.properties["Symbol"] = "BIST_DLY:XU030D1!"
+    identity = {"full_name": "BIST_DLY:XU030D1!", "pro_name": "BIST:XU030D1!",
+                "name": "XU030D1!", "exchange": "BIST"}
+    expected = dict(symbol="BIST:XU030D1!", timeframe="1",
+        date_range={"from": "2026-09-07", "to": "2026-09-20"},
+        chart_timezone="America/New_York",
+        cost_assumptions={"initial_capital": 100000, "position_size": 2,
+                          "slippage": 2, "commission_value": 0.01},
+        ui_metrics={"trades": 2, "net_profit": 17.91, "profit_factor": 1.328,
+                    "win_rate_pct": 50, "max_drawdown_pct": 0.03},
+        ui_date_label="Sep 7, 2026 — Sep 20, 2026", ui_update_pending=False)
+    assert len(verify_deep_export(report, **expected, symbol_identity=identity)) == 2
+    for proof in (None, dict(identity, exchange="OANDA"), dict(identity, pro_name="BIST:OTHER")):
+        with pytest.raises(DeepExportError, match="sembol"):
+            verify_deep_export(report, **expected, symbol_identity=proof)
+    expected["symbol"] = "XU030D1!"
+    with pytest.raises(DeepExportError, match="sembol"):
+        verify_deep_export(report, **expected, symbol_identity=identity)
+
+
 @pytest.mark.parametrize("change,error", [
     ({"symbol": "OANDA:EURUSD"}, "sembolü"),
     ({"timeframe": "15"}, "zaman dilimi"),

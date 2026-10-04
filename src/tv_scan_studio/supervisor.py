@@ -30,6 +30,7 @@ class WorkerState:
     last_seen: float = field(default_factory=time.time)
     error: str | None = None
     restarts: int = 0
+    attempts: int = 0
 
 
 class WorkerSupervisor:
@@ -112,7 +113,10 @@ class WorkerSupervisor:
                 state.status = "running"; state.last_seen = time.time()
                 worked = worker.run_one()
                 if worked:
-                    state.completed += 1; state.last_seen = time.time()
+                    state.attempts += 1
+                    if worker.last_completed:
+                        state.completed += 1
+                    state.last_seen = time.time()
                     continue
                 state.status = "idle"; state.last_seen = time.time()
                 if stop_when_idle: break

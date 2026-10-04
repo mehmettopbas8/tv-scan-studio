@@ -5,6 +5,18 @@ import zipfile
 from tools.build_release import build_release
 
 
+def test_release_version_is_the_package_version_and_hatch_source():
+    import tomllib
+    from tools.build_release import release_version
+    from tv_scan_studio import __version__
+    root = Path(__file__).resolve().parents[1]
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert release_version() == __version__
+    assert "version" in project["project"]["dynamic"]
+    assert "version" not in project["project"]
+    assert project["tool"]["hatch"]["version"]["path"] == "src/tv_scan_studio/__init__.py"
+
+
 def test_build_release_creates_verifiable_portable_zip(tmp_path: Path):
     source = tmp_path / "dist" / "TV-Scan-Studio"
     source.mkdir(parents=True)
@@ -17,6 +29,35 @@ def test_build_release_creates_verifiable_portable_zip(tmp_path: Path):
     assert checksum_file.read_text(encoding="ascii") == f"{checksum}  {archive.name}\n"
     with zipfile.ZipFile(archive) as bundle:
         assert "TV-Scan-Studio/TV-Scan-Studio.exe" in bundle.namelist()
+
+
+def test_release_cli_defaults_to_central_version(tmp_path):
+    import subprocess
+    import sys
+    from tools.build_release import release_version
+    root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "TV-Scan-Studio.exe"
+    source.write_bytes(b"test-single-executable")
+    output = tmp_path / "release"
+    result = subprocess.run(
+        [sys.executable, str(root / "tools/build_release.py"), str(source),
+         "--output", str(output)], capture_output=True, text=True, check=True,
+    )
+    version = release_version()
+    assert (output / f"TV-Scan-Studio-{version}.exe").read_bytes() == source.read_bytes()
+    assert (output / f"TV-Scan-Studio-{version}-portable.zip").is_file()
+    assert version in result.stdout
+
+
+def test_workflow_uses_central_version_and_all_packaged_probes():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/windows-build.yml").read_text(encoding="utf-8")
+    assert "tools/build_release.py --print-version" in workflow
+    assert "--version 0.2.0" not in workflow
+    assert "TV-Scan-Studio-0.2.0" not in workflow
+    assert "refs/tags/" in workflow
+    for probe in ("--helper-self-test", "--self-test", "--ui-smoke-test"):
+        assert workflow.count(probe) >= 2
 
 
 def test_single_executable_release_has_no_external_runtime(tmp_path):

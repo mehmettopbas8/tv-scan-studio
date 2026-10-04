@@ -12,6 +12,26 @@ SUCCESS = QtGui.QColor("#477a62")
 LINE = QtGui.QColor("#d8d0c2")
 
 
+class SafeWheelFilter(QtCore.QObject):
+    """Scroll the containing page; never change a closed value control."""
+
+    def eventFilter(self, watched, event):
+        if event.type() == QtCore.QEvent.Wheel and isinstance(
+                watched, (QtWidgets.QComboBox, QtWidgets.QAbstractSpinBox)):
+            if isinstance(watched, QtWidgets.QComboBox) and watched.view().isVisible():
+                return False
+            parent = watched.parentWidget()
+            while parent is not None:
+                if isinstance(parent, QtWidgets.QAbstractScrollArea):
+                    bar = parent.verticalScrollBar()
+                    bar.setValue(bar.value() - event.angleDelta().y() // 3)
+                    break
+                parent = parent.parentWidget()
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+
 class SwitchToggle(QtWidgets.QCheckBox):
     """QCheckBox semantics with a track/thumb rather than platform chrome."""
 
@@ -92,6 +112,19 @@ class DisclosureButton(QtWidgets.QPushButton):
 class DecisionChoice(QtWidgets.QComboBox):
     """Compact three-way scan decision with custom paint and native popup semantics."""
 
+    LABELS = {"Sabit bırak": "Sabit tut", "Tara": "Farklı değerleri dene", "Hariç tut": "Tarama dışında"}
+
+    def addItems(self, labels):
+        super().addItems([self.LABELS.get(label, label) for label in labels])
+
+    def currentText(self):
+        # Legacy serialized vocabulary stays stable while the UI uses plain language.
+        visible = super().currentText()
+        return next((key for key, value in self.LABELS.items() if value == visible), visible)
+
+    def setCurrentText(self, label):
+        super().setCurrentText(self.LABELS.get(label, label))
+
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
         self.setMinimumHeight(30)
@@ -101,6 +134,7 @@ class DecisionChoice(QtWidgets.QComboBox):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         state = self.currentText()
+        visible_label = super().currentText()
         if state == "Tara":
             surface, accent = QtGui.QColor("#eee0c7"), ACCENT
         elif state == "Hariç tut":
@@ -114,7 +148,7 @@ class DecisionChoice(QtWidgets.QComboBox):
         painter.setPen(INK if self.isEnabled() else MUTED)
         text_rect = QtCore.QRect(9, 0, max(0, self.width() - 28), self.height())
         painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
-                         painter.fontMetrics().elidedText(state, QtCore.Qt.ElideRight, text_rect.width()))
+                         painter.fontMetrics().elidedText(visible_label, QtCore.Qt.ElideRight, text_rect.width()))
         x, y = self.width() - 14, self.height() // 2
         painter.setPen(QtGui.QPen(MUTED, 1.5))
         path = QtGui.QPainterPath()

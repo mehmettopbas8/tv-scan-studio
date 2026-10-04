@@ -8,14 +8,16 @@ import json
 import itertools
 import math
 import unicodedata
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
 
 from .pine import parse_strategy_inputs, strategy_title
-from .planner import ScanPlan, enqueue_plan
-from .export import (export_results_csv, export_task_csv, export_task_xlsx,
+from .planner import ScanPlan, enqueue_plan, iter_tasks
+from .export import (CSV_FILTERS, export_results_csv, export_task_csv, export_task_xlsx,
                      export_project_task_scope)
 from .backup import create_backup, verify_backup, restore_backup
 from .resources import project_worker_throughput, recommend_workers, system_snapshot
@@ -25,6 +27,7 @@ from .tradingview import (GncZihinDriver, confirmed_strategy_identity_matches,
 from .windows import (TabCreationError, cdp_healthy, chart_targets, find_tradingview_executables,
                       launch_with_cdp, open_chart_tabs, worker_layout_candidates)
 from .storage import Store
+from .guided_tour import GuidedTour
 from .scan_values import parse_scan_values
 from .recommendations import historical_values_by_input, input_dependencies, suggest_input
 from .profiles import COST_SCENARIOS, FTMO_SYMBOL_PROFILES, apply_cost_multiplier
@@ -37,15 +40,17 @@ from .instance import desktop_instance
 from .sensitivity import one_input_neighbors, possible_no_effect_inputs
 from .session_variants import SESSION_IDS, observed_session_variants
 from .validation import enqueue_followups
-from .ui_controls import DecisionChoice, DisclosureButton, SwitchToggle
+from .ui_controls import DecisionChoice, DisclosureButton, SwitchToggle, SafeWheelFilter
+from .preparation import find_prepared_chart, prepare_empty_layout
+from .symbol_search import search_url, catalogue_results
 
 
 STYLE = """
-QWidget { background:#f8f5ef; color:#28332e; font-family:'Segoe UI'; font-size:13px; }
-QMainWindow { background:#f8f5ef; }
+QWidget { background:#f3f4f5; color:#292d32; font-family:'Segoe UI'; font-size:13px; }
+QMainWindow { background:#f3f4f5; }
 QLabel { background:transparent; }
-#rail { background:#ebe7dc; border-right:1px solid #d8d0c2; }
-#brand { color:#28332e; font-family:Georgia; font-size:21px; font-weight:700; padding:18px 14px; }
+#rail { background:#ffffff; border-right:1px solid #d9dde1; }
+#brand { color:#292d32; font-family:'Segoe UI'; font-size:19px; font-weight:600; padding:18px 14px; }
 #tagline { color:#68756d; padding:0 14px 20px 14px; }
 QPushButton { background:#fffdf9; color:#28332e; border:1px solid #d8d0c2; border-radius:7px; padding:8px 12px; }
 QPushButton:hover { background:#f2ecdf; border-color:#b9863f; }
@@ -68,9 +73,9 @@ QSpinBox::up-button,QSpinBox::down-button,QDoubleSpinBox::up-button,QDoubleSpinB
 QComboBox QAbstractItemView { background:#fffdf9; color:#28332e; border:1px solid #b9863f; selection-background-color:#efe9dc; }
 QHeaderView::section { background:#ebe7dc; color:#53635a; border:0; border-bottom:1px solid #d8d0c2; padding:8px; font-weight:600; }
 QTableWidget { gridline-color:#e7e3d9; alternate-background-color:#f8f5ef; }
-#title { font-family:Georgia; font-size:27px; font-weight:700; color:#28332e; }
+#title { font-family:'Segoe UI'; font-size:23px; font-weight:600; color:#292d32; }
 #subtitle { color:#68756d; font-size:14px; }
-#sectionTitle { color:#28332e; font-family:Georgia; font-size:18px; font-weight:600; padding:6px 0; }
+#sectionTitle { color:#292d32; font-family:'Segoe UI'; font-size:16px; font-weight:600; padding:6px 0; }
 #metric { background:#fffdf9; border:1px solid #e7e3d9; border-radius:8px; padding:16px; }
 #metricLabel { color:#68756d; font-size:12px; }
 #metricValue { border:0; background:transparent; color:#28332e; font-size:24px; font-weight:700; text-align:left; padding:0; }
@@ -79,6 +84,12 @@ QTableWidget { gridline-color:#e7e3d9; alternate-background-color:#f8f5ef; }
 #filterChip { background:#ece0c8; color:#3a322a; border:1px solid #ddc9a3; border-radius:6px; padding:5px 9px; }
 QProgressBar { background:#ebe7dc; border:1px solid #d8d0c2; border-radius:5px; color:#28332e; text-align:center; min-height:21px; }
 QProgressBar::chunk { background:#b9863f; border-radius:4px; }
+QPushButton[nav='true'] { background:#ffffff; color:#59636c; }
+QPushButton[nav='true']:checked { background:#f3f4f5; color:#292d32; }
+QPushButton,QLineEdit,QPlainTextEdit,QTableWidget,QComboBox,QSpinBox,QDoubleSpinBox,QListWidget { background:#ffffff; border-color:#d9dde1; color:#292d32; }
+QHeaderView::section { background:#eef0f2; color:#59636c; border-bottom-color:#d9dde1; }
+QTableWidget { gridline-color:#e3e6e9; alternate-background-color:#f3f4f5; }
+QSpinBox::up-button,QSpinBox::down-button,QDoubleSpinBox::up-button,QDoubleSpinBox::down-button { width:18px; }
 """
 
 STATUS_SUCCESS = "#477a62"
@@ -544,6 +555,57 @@ def data_path() -> Path:
     return base / "studio.db"
 
 
+class ChartPreparationJob(QtCore.QThread):
+    progress = QtCore.Signal(str)
+    completed = QtCore.Signal(object)
+
+    def __init__(self, driver, store, project, slot=0):
+        super().__init__()
+        self.driver, self.store, self.project = driver, store, dict(project)
+        self.cancelled = threading.Event()
+        self.journal_key = "automatic_preparation" if slot == 0 else f"automatic_preparation_parallel_{slot}"
+
+    def run(self):
+        project_id = self.project["id"]
+        try:
+            settings = self.store.settings(project_id) or {}
+            journal = dict(settings.get(self.journal_key) or {})
+            self.progress.emit("Bağlanıyor: bağımsız tarama grafiği hazırlanıyor…")
+            result = prepare_empty_layout(self.driver, chart_targets(), journal=journal,
+                persist=lambda value: self.store.save_settings(project_id, {self.journal_key: value}),
+                read_targets=chart_targets, cancelled=self.cancelled.is_set)
+            if not result.target_id:
+                raise TradingViewError(result.message + " " + result.technical_detail)
+            def guard(target):
+                if self.cancelled.is_set():
+                    raise TradingViewError("Hazırlık durduruldu; kayıtlı tarama grafiği korunuyor.")
+                current = chart_targets()
+                names = {item["id"]: self.driver.layout_name(item["id"]) for item in current}
+                if worker_layout_candidates(current, names).get(target) != result.chart_id:
+                    raise TradingViewError("Tarama grafiğinin bağımsız kimliği değişti; hazırlık durduruldu.")
+            self.progress.emit("Bağlanıyor: ayrı özel strateji yükleniyor ve kaynak doğrulanıyor…")
+            source_journal = dict((self.store.settings(project_id) or {}).get("private_source_preparation") or {})
+            self.driver.load_private_source(result.target_id, self.project["pine_source"],
+                journal=source_journal,
+                persist=lambda value: self.store.save_settings(project_id, {"private_source_preparation": value}),
+                guard=guard)
+            guard(result.target_id)
+            self.store.save_settings(project_id, {"prepared_chart_id": result.chart_id})
+            self.completed.emit({"project_id": project_id, "success": True})
+        except Exception as exc:
+            self.completed.emit({"project_id": project_id, "success": False, "error": str(exc)})
+
+
+class StudioMainWindow(QtWidgets.QMainWindow):
+    """Closing the UI must end its timers, not leave invisible preparation alive."""
+
+    def closeEvent(self, event):
+        callback = getattr(self, "shutdown", None)
+        if callback is not None:
+            callback()
+        super().closeEvent(event)
+
+
 class StudioWindow:
     def __init__(self, store: Store):
         self.QtWidgets = QtWidgets
@@ -551,16 +613,22 @@ class StudioWindow:
         self.store.recover_interrupted()
         self.supervisor = None
         self.driver = None
-        self.window = QtWidgets.QMainWindow()
+        self.window = StudioMainWindow()
+        self.window.shutdown = self.shutdown
         self.window.setWindowTitle("TV Scan Studio")
+        self.window.setWindowIcon(QtGui.QIcon(str(Path(__file__).parent / "assets" / "app-icon.ico")))
         self.window.resize(1240, 780)
         self._last_dashboard_counts = None
         self._notified_worker_errors = set()
         self._notified_worker_restarts = set()
         self._safe_worker_targets = set()  # Only explicitly claimed independent layouts in this session.
         self._safe_worker_layouts = {}  # Explicitly claimed, unique saved layouts: target -> chart ID.
+        self._preparing = False
+        self._saved_project_id = None
+        self._wheel_filter = SafeWheelFilter(self.window)
+        QtWidgets.QApplication.instance().installEventFilter(self._wheel_filter)
         self.tray = QtWidgets.QSystemTrayIcon(
-            self.window.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon), self.window
+            self.window.windowIcon(), self.window
         )
         self.tray.setToolTip("TV Scan Studio")
         if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
@@ -587,6 +655,7 @@ class StudioWindow:
         self.pages.addWidget(self.results_page)
         self.pages.addWidget(self.research_page)
         self.pages.addWidget(self.settings_page)
+        self._simplify_navigation()
         layout.addWidget(self.pages, 1)
         self.window.setCentralWidget(root)
         self.result_detail_dock = QtWidgets.QDockWidget("Preset ayrıntısı", self.window)
@@ -606,11 +675,13 @@ class StudioWindow:
         self.worker_timer.timeout.connect(self.refresh_worker_states)
         self.worker_timer.start(1000)
         self.refresh_dashboard()
+        self.refresh_project_selectors()
+        self._show_page(1)
 
     def _rail(self):
         Q = self.QtWidgets
         rail = Q.QFrame(objectName="rail")
-        rail.setFixedWidth(224)
+        rail.setFixedWidth(180)
         box = Q.QVBoxLayout(rail)
         box.setContentsMargins(0, 0, 0, 16)
         box.addWidget(Q.QLabel("TV Scan Studio", objectName="brand"))
@@ -618,7 +689,7 @@ class StudioWindow:
         group = Q.QButtonGroup(rail)
         group.setExclusive(True)
         self.nav_group = group
-        for index, label in enumerate(("Tarama masası", "Yeni proje", "Tarama ayarları", "Worker dağıtımı", "Sonuçlar ve hatalar", "Araştırma presetleri", "Ayarlar")):
+        for index, label in ((1, "Stratejiler"), (2, "Tarama"), (4, "Sonuçlar")):
             button = Q.QPushButton(label)
             button.setProperty("nav", True)
             button.setCheckable(True)
@@ -627,10 +698,605 @@ class StudioWindow:
             group.addButton(button, index)
             box.addWidget(button)
         box.addStretch()
+        settings = Q.QPushButton("Ayarlar")
+        settings.clicked.connect(lambda: self._show_auxiliary(6, "Genel ayarlar"))
+        box.addWidget(settings)
         privacy = Q.QLabel("Veriler yalnızca bu bilgisayarda tutulur", objectName="tagline")
         privacy.setWordWrap(True)
         box.addWidget(privacy)
         return rail
+
+    def _show_auxiliary(self, index, title):
+        """Keep legacy tools available without adding main navigation screens."""
+        page = self.pages.widget(index)
+        self.pages.removeWidget(page)
+        dialog = QtWidgets.QDialog(self.window)
+        dialog.setWindowTitle(title)
+        dialog.resize(1100, 740)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(page)
+        # Stacked pages retain their explicit hidden state when reparented.
+        page.show()
+        close = QtWidgets.QPushButton("Kapat")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        try:
+            dialog.exec()
+        finally:
+            layout.removeWidget(page)
+            page.setParent(self.pages)
+            self.pages.insertWidget(index, page)
+            page.hide()
+
+    def _simplify_navigation(self):
+        self.tv_executable.setText(str(self.store.app_settings().get("tradingview_executable", "")))
+        self.tv_executable.editingFinished.connect(lambda: self.store.save_app_settings(
+            {"tradingview_executable": self.tv_executable.text().strip()}))
+        self.new_tab_count.setValue(1)
+        scan_layout = self.scan_setup.widget().layout() if isinstance(self.scan_setup, QtWidgets.QScrollArea) else self.scan_setup.layout()
+        parallel = QtWidgets.QHBoxLayout()
+        parallel.addWidget(QtWidgets.QLabel("Paralel tarama grafiği"))
+        self.parallel_count = QtWidgets.QSpinBox()
+        self.parallel_count.setRange(1, 16)
+        self.parallel_count.setValue(int(self.store.app_settings().get("parallel_graphs", 1)))
+        self.parallel_count.setToolTip("Her grafik bağımsız hazırlanır ve kaynağı doğrulanır. Daha fazla grafik her zaman daha hızlı değildir.")
+        self.parallel_count.valueChanged.connect(lambda value: self.store.save_app_settings({"parallel_graphs": value}))
+        parallel.addWidget(self.parallel_count)
+        self.parallel_recommendation = QtWidgets.QLabel("Kaynak önerisi henüz ölçülmedi.")
+        parallel.addWidget(self.parallel_recommendation, 1)
+        measure = QtWidgets.QPushButton("Kaynakları ölç")
+        measure.clicked.connect(self.measure_parallel_resources)
+        parallel.addWidget(measure)
+        scan_layout.insertLayout(1, parallel)
+        # Expose existing projects by name on the first screen.
+        layout = (self.new_project.widget().layout() if isinstance(self.new_project, QtWidgets.QScrollArea)
+                  else self.new_project.layout())
+        self.strategy_list = QtWidgets.QComboBox()
+        self.strategy_list.setAccessibleName("Kayıtlı stratejiler")
+        self.strategy_list.addItem("Yeni strateji ekle", None)
+        for project in self.store.projects():
+            self.strategy_list.addItem(project["name"], project["id"])
+        self.strategy_list.activated.connect(self.open_saved_strategy)
+        layout.insertWidget(1, self.strategy_list)
+        self.prepare_saved_button = QtWidgets.QPushButton("Taramayı hazırla", objectName="primary")
+        self.prepare_saved_button.setEnabled(False)
+        self.prepare_saved_button.clicked.connect(self.prepare_saved_strategy)
+        layout.addWidget(self.prepare_saved_button)
+        result_layout = (self.results_page.widget().layout() if isinstance(self.results_page, QtWidgets.QScrollArea)
+                         else self.results_page.layout())
+        self.run_progress = QtWidgets.QLabel("Henüz tarama başlatılmadı.")
+        self.run_progress.setWordWrap(True)
+        result_layout.insertWidget(1, self.run_progress)
+        self.run_performance = QtWidgets.QLabel("Hız: ölçüm bekleniyor · aktif grafik: 0")
+        self.run_performance.setWordWrap(True)
+        result_layout.insertWidget(2, self.run_performance)
+        stop = QtWidgets.QPushButton("Taramayı durdur")
+        stop.clicked.connect(self.stop_workers)
+        result_layout.insertWidget(2, stop)
+        utilities = QtWidgets.QHBoxLayout()
+        presets = QtWidgets.QPushButton("Kaydettiğim presetler")
+        presets.clicked.connect(self.show_saved_presets)
+        utilities.addWidget(presets)
+        tasks_backup = QtWidgets.QPushButton("Görevler ve yedekleme")
+        tasks_backup.clicked.connect(self.show_tasks_backup)
+        utilities.addWidget(tasks_backup)
+        historical = QtWidgets.QPushButton("Geçmiş taramalar")
+        historical.clicked.connect(self.show_historical_scans)
+        utilities.addWidget(historical)
+        result_layout.addLayout(utilities)
+
+    def show_historical_scans(self):
+        from .historical_dialog import HistoricalDialog
+        tour = getattr(self, "guided_tour", None)
+        if tour is not None:
+            tour.finish()
+        HistoricalDialog(self.store, self.window).exec()
+
+    def show_tasks_backup(self):
+        """A direct task browser, independent of hidden dashboard stack pages."""
+        active_tour = getattr(self, "guided_tour", None)
+        if active_tour is not None:
+            active_tour.finish()
+        Q = QtWidgets
+        dialog = Q.QDialog(self.window)
+        dialog.setWindowTitle("Görevler ve yedekleme")
+        dialog.resize(900, 620)
+        layout = Q.QVBoxLayout(dialog)
+        introduction = Q.QLabel("Tarama görevlerini incele veya projelerini, sonuçlarını, ayarlarını ve kaydettiğin presetleri yedekle.")
+        introduction.setWordWrap(True); layout.addWidget(introduction)
+        controls = Q.QHBoxLayout()
+        projects = Q.QComboBox(); projects.setObjectName("backupTaskProject")
+        projects.addItem("Tüm stratejiler", None)
+        for project in self.store.projects():
+            projects.addItem(project["name"], project["id"])
+        states = Q.QComboBox(); states.setObjectName("backupTaskState")
+        states.addItem("Tüm görevler", None)
+        for key, label in (("pending", "Bekleyen"), ("running", "Çalışan"), ("done", "Tamamlanan"),
+                           ("failed", "Hata"), ("manual_review", "İnceleme gerekli"), ("cancelled", "İptal edilen")):
+            states.addItem(label, key)
+        refresh = Q.QPushButton("Yenile")
+        for widget in (projects, states, refresh): controls.addWidget(widget)
+        layout.addLayout(controls)
+        summary = Q.QLabel(); summary.setWordWrap(True); layout.addWidget(summary)
+        table = Q.QTableWidget(0, 5); table.setObjectName("backupTaskTable")
+        table.setHorizontalHeaderLabels(["Strateji", "Durum", "Sembol", "Zaman dilimi", "Ayar sayısı"])
+        table.setEditTriggers(Q.QAbstractItemView.NoEditTriggers)
+        table.horizontalHeader().setSectionResizeMode(Q.QHeaderView.Stretch)
+        layout.addWidget(table, 1)
+        status = Q.QLabel(); status.setWordWrap(True); status.setObjectName("backupOperationStatus")
+        layout.addWidget(status)
+        def reload():
+            total, rows = self.store.task_summaries(states.currentData(), project_id=projects.currentData())
+            labels = {states.itemData(i): states.itemText(i) for i in range(states.count())}
+            summary.setText(f"{total:,} görev · son {len(rows):,} kayıt gösteriliyor." if total else
+                            "Bu seçimde görev yok. Tarama ekranında Hazırla ve başlat ile görev oluşturabilirsin.")
+            table.setRowCount(len(rows))
+            for index, row in enumerate(rows):
+                payload = row["payload"]
+                values = (row["project"], labels.get(row["status"], row["status"]), payload.get("symbol", "—"),
+                          self._timeframe_label(payload.get("timeframe", "")), len(payload.get("inputs") or {}))
+                for column, value in enumerate(values):
+                    item = Q.QTableWidgetItem(str(value))
+                    item.setToolTip(f'Test #{row["task_id"]}')
+                    table.setItem(index, column, item)
+        projects.currentIndexChanged.connect(reload); states.currentIndexChanged.connect(reload)
+        refresh.clicked.connect(reload)
+        backup_actions = Q.QHBoxLayout()
+        def backup_operation(operation):
+            operation()
+            status.setText(self.dashboard_status.text())
+        backup = Q.QPushButton("Yedek oluştur"); backup.setObjectName("createTaskBackup")
+        backup.clicked.connect(lambda: backup_operation(self.create_portable_backup))
+        restore = Q.QPushButton("Yedeği yeni dosyaya aç"); restore.setObjectName("restoreTaskBackup")
+        restore.clicked.connect(lambda: backup_operation(self.restore_portable_backup))
+        restore.setToolTip("Mevcut veritabanına dokunmaz; ayrı bir dosya oluşturur.")
+        backup_actions.addWidget(backup); backup_actions.addWidget(restore)
+        layout.addLayout(backup_actions)
+        advanced = DisclosureButton("Gelişmiş proje yönetimi")
+        management = Q.QPushButton("Öncelik, iptal ve yeniden deneme araçlarını aç")
+        management.clicked.connect(lambda: self._show_auxiliary(0, "Proje yönetimi"))
+        management.hide()
+        advanced.toggled.connect(management.setVisible)
+        layout.addWidget(advanced); layout.addWidget(management)
+        close = Q.QPushButton("Kapat"); close.clicked.connect(dialog.accept); layout.addWidget(close)
+        reload()
+        dialog.exec()
+
+    def save_local_preset(self, task_id):
+        project_id = self.result_project.currentData()
+        name, accepted = QtWidgets.QInputDialog.getText(self.window, "Preset kaydet", "Bu testin ayarlarına bir ad ver:")
+        if not accepted:
+            return
+        try:
+            self.store.save_result_preset(project_id, task_id, name)
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self.window, "Preset kaydedilemedi", str(error))
+            return
+        QtWidgets.QMessageBox.information(self.window, "Preset kaydedildi", "Testin ayarları Kaydettiğim presetler listesine kaydedildi. Aynı test tekrar kaydedilirse kopya oluşmaz.")
+
+    def show_saved_presets(self):
+        dialog = QtWidgets.QDialog(self.window)
+        dialog.setWindowTitle("Kaydettiğim presetler")
+        dialog.resize(760, 560)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        presets = self.store.saved_presets()
+        note = QtWidgets.QLabel("Preset, bir testte kullanılan ayarların kaydıdır; gelecekte kâr garantisi değildir." if presets else
+            "Henüz preset kaydetmedin. Sonuçlarda bir testi açıp ‘Bu testi preset olarak kaydet’ düğmesine bas.")
+        note.setWordWrap(True); layout.addWidget(note)
+        listing = QtWidgets.QListWidget()
+        for preset in presets:
+            snapshot = preset["snapshot"]
+            payload = snapshot["result"]["payload"]
+            item = QtWidgets.QListWidgetItem(f'{preset["name"]} — {snapshot["project_name"]} — {payload.get("symbol", "")} / {self._timeframe_label(payload.get("timeframe", ""))}')
+            listing.addItem(item)
+        layout.addWidget(listing)
+        details = QtWidgets.QPlainTextEdit(); details.setReadOnly(True)
+        layout.addWidget(details)
+        reuse = QtWidgets.QPushButton("Seçili presetin ayarlarını taramaya taşı")
+        reuse.setEnabled(False)
+        def show_details(index):
+            if index < 0:
+                return
+            snapshot = presets[index]["snapshot"]
+            row = snapshot["result"]
+            definitions = parse_strategy_inputs(snapshot.get("pine_source", ""))
+            names = {f"in_{i}": item.title for i, item in enumerate(definitions)}
+            lines = [f'Test #{row["task_id"]} · {row["classification"]}',
+                     "Ayar adları kayıt anındaki proje kodundandır; testin kaynak doğrulaması teknik kanıtta saklanır.", ""]
+            lines.extend(f'{names.get(key, "Tanımı bulunamayan ayar")}: {value}' for key, value in row["payload"].get("inputs", {}).items())
+            lines.extend(["", "Tarih, maliyet ve kanıt (değiştirilmemiş kayıt):", json.dumps(
+                {"date_range": row["payload"].get("date_range"), "costs": row["payload"].get("costs"),
+                 "metrics": row["metrics"], "evidence": row.get("evidence", {})}, ensure_ascii=False, indent=2)])
+            details.setPlainText("\n".join(lines)); reuse.setEnabled(True)
+        listing.currentRowChanged.connect(show_details)
+        def use_selected():
+            if listing.currentRow() >= 0 and self.apply_saved_preset(presets[listing.currentRow()]):
+                dialog.accept()
+        reuse.clicked.connect(use_selected); layout.addWidget(reuse)
+        close = QtWidgets.QPushButton("Kapat"); close.clicked.connect(dialog.accept); layout.addWidget(close)
+        if presets:
+            listing.setCurrentRow(0)
+        dialog.exec()
+
+    def apply_saved_preset(self, preset):
+        snapshot = preset["snapshot"]
+        project = self.store.project(preset["project_id"])
+        if not project or project["pine_hash"] != snapshot["pine_hash"]:
+            QtWidgets.QMessageBox.warning(self.window, "Preset uygulanamadı", "Strateji kodu değişmiş veya proje bulunamıyor. Eski ayarlar farklı bir kaynağa otomatik uygulanmaz.")
+            return False
+        answer = QtWidgets.QMessageBox.question(self.window, "Ayarları taramaya taşı",
+            "Bu presetin Pine ayarları, sembolü ve zaman dilimi Tarama ekranına taşınacak.\n"
+            "Tarih, maliyetler ve başarı ölçütleri değiştirilmez; yeniden test etmeden önce bunları ayrıca kontrol et.\n"
+            "Bu işlem görev oluşturmaz ve tarama başlatmaz. Devam edilsin mi?")
+        if answer != QtWidgets.QMessageBox.Yes:
+            return False
+        payload = snapshot["result"]["payload"]
+        values = payload.get("inputs") or {}
+        self.store.save_settings(project["id"], {"symbols": [payload["symbol"]],
+            "timeframes": [str(payload["timeframe"])], "input_values": {key: [value] for key, value in values.items()},
+            "input_ui": {key: {"decision": "Tara", "values": [value]} for key, value in values.items()}})
+        self._show_page(2)
+        self.plan_project.setCurrentIndex(self.plan_project.findData(project["id"]))
+        self.load_plan_inputs()
+        return True
+
+    def import_research_archive(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self.window, "Araştırma arşivi içe aktar", "", "Araştırma kataloğu (*.json)")
+        if not path:
+            return
+        from .research import read_imported_catalog
+        try:
+            catalog = read_imported_catalog(Path(path))
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            QtWidgets.QMessageBox.warning(self.window, "Arşiv açılamadı", "Geçerli TV Scan araştırma kataloğu gerekli.\n" + str(error))
+            return
+        self.store.save_app_settings({"imported_research_catalog": catalog})
+        old = self.pages.widget(5)
+        self.pages.removeWidget(old)
+        self.research_page = self._research_page()
+        self.pages.insertWidget(5, self.research_page)
+        old.deleteLater()
+        self.refresh_project_selectors()
+        self.archive_open_button.setEnabled(True)
+        self.settings_status.setText("Araştırma arşivi içe aktarıldı. İçe aktarma sonuçları yeniden doğrulamaz; kendi presetlerinle karıştırılmaz.")
+
+    def open_saved_strategy(self):
+        project_id = self.strategy_list.currentData()
+        project = self.store.project(project_id) if project_id is not None else None
+        self._saved_project_id = project_id
+        self.project_name.setText(project["name"] if project else "")
+        self.pine_source.setPlainText(project["pine_source"] if project else "")
+        self.prepare_saved_button.setEnabled(project is not None)
+
+    def prepare_saved_strategy(self):
+        self.refresh_project_selectors()
+        self.plan_project.setCurrentIndex(self.plan_project.findData(self._saved_project_id))
+        self._show_page(2)
+
+    def choose_timeframes(self):
+        dialog = QtWidgets.QDialog(self.window)
+        dialog.setWindowTitle("Zaman dilimleri")
+        box = QtWidgets.QVBoxLayout(dialog)
+        selected = set(self._timeframe_codes(self.timeframes.text()))
+        choices = []
+        for code, label in (("1", "1 dakika"), ("5", "5 dakika"), ("15", "15 dakika"),
+                            ("30", "30 dakika"), ("60", "1 saat"), ("240", "4 saat"), ("1D", "1 gün")):
+            check = QtWidgets.QCheckBox(label)
+            check.setChecked(code in selected or (code == "60" and "1H" in selected))
+            box.addWidget(check)
+            choices.append((code, check))
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Seç")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Vazgeç")
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self.timeframes.setText(", ".join(self._timeframe_label(code) for code, check in choices if check.isChecked()))
+
+    def choose_symbols(self):
+        dialog = QtWidgets.QDialog(self.window)
+        dialog.setWindowTitle("Sembol seç")
+        dialog.resize(500, 380)
+        box = QtWidgets.QVBoxLayout(dialog)
+        search = QtWidgets.QLineEdit()
+        search.setPlaceholderText("Sembol veya şirket adı yazın")
+        box.addWidget(search)
+        lookup = QtWidgets.QPushButton("TradingView'de ara")
+        box.addWidget(lookup)
+        note = QtWidgets.QLabel("Arama TradingView sembol kataloğunda yapılır. Veri erişimi ve tarama koşulları ayrı grafikte ayrıca doğrulanır. İnternet yoksa kayıtlı semboller kullanılabilir.")
+        note.setWordWrap(True); box.addWidget(note)
+        listing = QtWidgets.QListWidget(); box.addWidget(listing)
+        symbols = {"BIST:XU030D1!"}
+        for values in FTMO_SYMBOL_PROFILES.values():
+            symbols.update(values)
+        for chart in getattr(self, "_last_inventory", []):
+            if chart.get("symbol"):
+                symbols.add(chart["symbol"])
+        selected = {s.strip() for s in self.symbols.text().split(",") if s.strip()}
+        symbols.update(selected)
+        for symbol in sorted(symbols):
+            item = QtWidgets.QListWidgetItem(symbol)
+            item.setData(QtCore.Qt.UserRole, symbol)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked if symbol in selected else QtCore.Qt.Unchecked)
+            listing.addItem(item)
+        search.textChanged.connect(lambda text: [listing.item(i).setHidden(text.casefold() not in listing.item(i).text().casefold()) for i in range(listing.count())])
+        manager = QtNetwork.QNetworkAccessManager(dialog)
+        def request_catalogue():
+            try:
+                request = QtNetwork.QNetworkRequest(QtCore.QUrl(search_url(search.text())))
+            except ValueError as exc:
+                note.setText(str(exc))
+                return
+            request.setRawHeader(b"Origin", b"https://www.tradingview.com")
+            request.setRawHeader(b"Referer", b"https://www.tradingview.com/")
+            request.setTransferTimeout(8000)
+            lookup.setEnabled(False)
+            note.setText("TradingView sembolleri aranıyor…")
+            reply = manager.get(request)
+            def complete():
+                lookup.setEnabled(True)
+                try:
+                    if reply.error() != QtNetwork.QNetworkReply.NoError:
+                        raise ValueError("Sembol servisine ulaşılamadı. Kayıtlı sembolleri kullanabilir veya yeniden deneyebilirsiniz.")
+                    rows = catalogue_results(json.loads(bytes(reply.readAll())))
+                    known = {listing.item(i).data(QtCore.Qt.UserRole): listing.item(i)
+                             for i in range(listing.count())}
+                    for row in rows:
+                        item = known.get(row["code"])
+                        if item is None:
+                            item = QtWidgets.QListWidgetItem()
+                            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                            item.setCheckState(QtCore.Qt.Unchecked)
+                            item.setData(QtCore.Qt.UserRole, row["code"])
+                            listing.addItem(item)
+                        item.setText(f"{row['name']} · {row['exchange']}")
+                        item.setToolTip(row["code"])
+                        item.setHidden(False)
+                    note.setText(f"{len(rows)} sembol bulundu. İstediklerinizi işaretleyin." if rows else
+                                 "Sembol bulunamadı. Daha kısa bir adla yeniden arayın.")
+                except (ValueError, TypeError) as exc:
+                    note.setText(str(exc))
+                finally:
+                    reply.deleteLater()
+            reply.finished.connect(complete)
+        lookup.clicked.connect(request_catalogue)
+        search.returnPressed.connect(request_catalogue)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Seç")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Vazgeç")
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self.symbols.setText(", ".join(listing.item(i).data(QtCore.Qt.UserRole) for i in range(listing.count())
+                                        if listing.item(i).checkState() == QtCore.Qt.Checked))
+
+    def choose_dates(self):
+        dialog = QtWidgets.QDialog(self.window)
+        dialog.setWindowTitle("Tarih aralığı")
+        box = QtWidgets.QFormLayout(dialog)
+        fields = []
+        for title, source in (("Başlangıç", self.date_from), ("Bitiş", self.date_to)):
+            field = QtWidgets.QDateEdit()
+            field.setCalendarPopup(True); field.setDisplayFormat("yyyy-MM-dd")
+            parsed = QtCore.QDate.fromString(source.text(), "yyyy-MM-dd")
+            field.setDate(parsed if parsed.isValid() else QtCore.QDate.currentDate())
+            box.addRow(title, field); fields.append(field)
+        clear = QtWidgets.QPushButton("Grafikteki mevcut geçmişi kullan")
+        clear.clicked.connect(lambda: dialog.done(2)); box.addRow(clear)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); box.addRow(buttons)
+        result = dialog.exec()
+        if result == 2:
+            self.date_from.clear(); self.date_to.clear()
+        elif result == QtWidgets.QDialog.Accepted:
+            self.date_from.setText(fields[0].date().toString("yyyy-MM-dd"))
+            self.date_to.setText(fields[1].date().toString("yyyy-MM-dd"))
+
+    def focus_missing_field(self):
+        field = self.symbols if not self.symbols.text().strip() else self.timeframes if not self.timeframes.text().strip() else self.date_from
+        self.scan_scroll.ensureWidgetVisible(field)
+        field.setFocus()
+
+    def prepare_and_start(self):
+        if self._preparing or (getattr(self, "_connection_timer", None) and self._connection_timer.isActive()) or (self.supervisor and self.supervisor.running):
+            return
+        self._preparing = True
+        self.enqueue_plan_button.setEnabled(False)
+        try:
+            project_id = self.plan_project.currentData()
+            project = self.store.project(project_id) if project_id is not None else None
+            if not project:
+                raise ValueError("Önce bir strateji seçin.")
+            plan = self._current_plan()
+            plan.validate(require_study_id=False)
+            if plan.date_range and not (GncZihinDriver.date_range_ready and GncZihinDriver.deep_capture_ready):
+                raise ValueError("Özel tarih aralığı bu sürümde doğrulanmadı. Tarihleri temizleyerek grafikteki geçmişle devam edebilirsiniz.")
+            self.connection_status.setText("Bağlanıyor: TradingView kontrol ediliyor…")
+            if not cdp_healthy():
+                path = self.tv_executable.text().strip()
+                if not Path(path).is_file():
+                    self.find_tradingview()
+                    path = self.tv_executable.text().strip()
+                if not Path(path).is_file():
+                    raise ValueError("TradingView bulunamadı. Gelişmiş ayarlardan uygulama yolunu seçin.")
+                launch_with_cdp(path)
+                self.connection_status.setText("Bağlanıyor: TradingView açılıyor. Hazır olduğunda devam edilecek.")
+                self._connection_deadline = __import__('time').monotonic() + 30
+                self._preparing = False
+                self._connection_timer = QtCore.QTimer(self.window)
+                self._connection_timer.setInterval(1500)
+                self._connection_timer.timeout.connect(self._wait_for_connection)
+                self._connection_timer.start()
+                return
+            self.driver = GncZihinDriver(self.motor_path.text().strip())
+            targets = chart_targets()
+            prepared_charts = []
+            requested = self.parallel_count.value()
+            self.parallel_count.setEnabled(False)
+            for _ in range(requested):
+                prepared = find_prepared_chart(self.driver, targets, project,
+                    preferred_chart_id=(self.store.settings(project_id) or {}).get("prepared_chart_id"),
+                    excluded_targets={item.target_id for item in prepared_charts})
+                if prepared.target_id is None:
+                    break
+                prepared_charts.append(prepared)
+            if len(prepared_charts) < requested:
+                self.connection_status.setText("İşlem gerekli: " + prepared.message)
+                self.connection_status.setToolTip(prepared.technical_detail)
+                answer = QtWidgets.QMessageBox.question(self.window, "Ayrı tarama grafiği oluştur",
+                    f"{project['name']} için yeni bağımsız tarama grafiği oluşturulsun mu?\n\n"
+                    "Strateji kodu TradingView hesabınıza ayrı bir özel script olarak kaydedilecek; "
+                    "yayımlanmayacak ve mevcut scriptler değiştirilmeyecek. Kişisel grafikler korunacak. "
+                    "Hazırlık bittiğinde tarama başlamadan önce test özeti için onay alınacak.")
+                if answer == QtWidgets.QMessageBox.Yes:
+                    self._preparation_job = ChartPreparationJob(self.driver, self.store, project, slot=len(prepared_charts))
+                    application = QtWidgets.QApplication.instance()
+                    jobs = getattr(application, "_chart_preparation_jobs", [])
+                    jobs.append(self._preparation_job)
+                    application._chart_preparation_jobs = jobs
+                    job = self._preparation_job
+                    job.progress.connect(self.connection_status.setText)
+                    job.completed.connect(self._automatic_preparation_completed)
+                    job.finished.connect(lambda: jobs.remove(job) if job in jobs else None)
+                    job.start()
+                return
+            answer = QtWidgets.QMessageBox.question(self.window, "Tarama grafiği kullanım onayı",
+                f"Strateji: {project['name']}\n"
+                f"Tarama grafikleri ({requested}): {', '.join(self.driver.layout_name(item.target_id) for item in prepared_charts)}\n"
+                f"{plan.task_count} test: {', '.join(plan.symbols)} / "
+                f"{', '.join(self._timeframe_label(tf) for tf in plan.timeframes)}.\n"
+                + "\n".join(f"{item.title}: {', '.join(map(str, plan.input_values.get(f'in_{index}', [])))}"
+                    for index, item in enumerate(self._plan_parsed_inputs)
+                    if len(plan.input_values.get(f'in_{index}', [])) > 1) + "\n"
+                "Yalnız bu tarama grafikleri değiştirilecek; kişisel grafikler korunacak. Devam edilsin mi?")
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+            prepared = prepared_charts[0]
+            for item in prepared_charts:
+                self._safe_worker_layouts[item.target_id] = item.chart_id
+                self._safe_worker_targets.add(item.target_id)
+            self.store.save_settings(project_id, {"prepared_chart_id": prepared.chart_id})
+            self.worker_project.setCurrentIndex(self.worker_project.findData(project_id))
+            self.discover_targets()
+            selected_rows = []
+            assignments = []
+            for item in prepared_charts:
+                row = next((r for r in range(self.worker_table.rowCount())
+                    if self.worker_table.item(r, 2).data(QtCore.Qt.UserRole) == item.target_id), None)
+                if row is None:
+                    raise ValueError("Hazırlanan grafik artık açık değil. Yeniden hazırlayın.")
+                self.worker_table.cellWidget(row, 3).setCurrentIndex(
+                    self.worker_table.cellWidget(row, 3).findData(project_id))
+                self.refresh_worker_match(row)
+                self.worker_table.setCurrentCell(row, 4)
+                self.bind_selected_strategy()
+                if self.worker_table.item(row, 5).text() != WORKER_READY_LABEL:
+                    raise ValueError("Kaynak doğrulaması tamamlanmadı. " + self.worker_status.text())
+                strategy = self.worker_table.item(row, 4).data(QtCore.Qt.UserRole)
+                selected_rows.append(row)
+                assignments.append(WorkerAssignment(int(self.worker_table.item(row, 1).text()), item.target_id, (project_id,), strategy["id"]))
+            row = selected_rows[0]
+            strategy = self.worker_table.item(row, 4).data(QtCore.Qt.UserRole)
+            self.strategy_picker.clear()
+            self.strategy_picker.addItem(strategy.get("name", project["name"]),
+                {"study_id": strategy["id"], "source_confirmed": True})
+            self.study_id.setText(strategy["id"])
+            for r in range(self.worker_table.rowCount()):
+                self.worker_table.item(r, 0).setCheckState(QtCore.Qt.Checked if r in selected_rows else QtCore.Qt.Unchecked)
+            self._validate_live_worker_assignments(assignments)
+            ready_plan = self._current_plan()
+            pending = {task["task_key"] for task in self.store.tasks(project_id, "pending")}
+            if pending:
+                for key, _payload in iter_tasks(ready_plan):
+                    pending.discard(key)
+                    if not pending:
+                        break
+                if pending:
+                    raise ValueError("Bu stratejide başka bir taramadan bekleyen görevler var. Sonuçlar > Görevler bölümünde onları inceleyin; bu hazırlık eski görevleri otomatik çalıştırmaz.")
+            self._persist_input_choices(project_id)
+            enqueue_plan(self.store, project_id, ready_plan)
+            self.start_workers(confirmed=True)
+            if self.supervisor and self.supervisor.running:
+                self.connection_status.setText("Hazır: tarama çalışıyor.")
+                self._show_page(4)
+            else:
+                raise ValueError(self.worker_status.text())
+        except Exception as exc:
+            self.connection_status.setText("İşlem gerekli: " + self._friendly_error(exc))
+            self.connection_status.setToolTip(str(exc))
+        finally:
+            self._preparing = bool(getattr(self, "_preparation_job", None) and self._preparation_job.isRunning())
+            self.parallel_count.setEnabled(not bool(self._preparing or (self.supervisor and self.supervisor.running)))
+            self.preview_plan()
+
+    def _automatic_preparation_completed(self, result):
+        self._preparing = False
+        if getattr(self, "_closing", False):
+            return
+        if result.get("success"):
+            self.connection_status.setText("Hazır: bağımsız grafik ve strateji kaynağı doğrulandı.")
+            if self.plan_project.currentData() == result["project_id"]:
+                QtCore.QTimer.singleShot(0, self.prepare_and_start)
+        else:
+            self.connection_status.setText("İşlem gerekli: " + self._friendly_error(RuntimeError(result["error"])))
+            self.connection_status.setToolTip(result["error"])
+        self.preview_plan()
+
+    def _wait_for_connection(self):
+        if cdp_healthy():
+            self._connection_timer.stop()
+            self.prepare_and_start()
+        elif __import__('time').monotonic() >= self._connection_deadline:
+            self._connection_timer.stop()
+            self.connection_status.setText("İşlem gerekli: TradingView bağlantısı 30 saniyede kurulamadı. Uygulamanın açıldığını kontrol edip tekrar deneyin.")
+            self.preview_plan()
+
+    def _persist_input_choices(self, project_id):
+        self.store.save_settings(project_id, {"input_ui": {
+            self.plan_inputs.item(row, 0).text(): {
+                "decision": self.plan_inputs.cellWidget(row, 3).currentText(),
+                "values": self.plan_inputs.item(row, 4).data(QtCore.Qt.UserRole) or [],
+                "range": self.plan_inputs.item(row, 4).data(QtCore.Qt.UserRole + 1) or {},
+            } for row in range(self.plan_inputs.rowCount())
+        }})
+
+    @staticmethod
+    def _timeframe_codes(text):
+        import re
+        labels = {"1 dakika": "1", "5 dakika": "5", "15 dakika": "15", "30 dakika": "30",
+                  "1 saat": "60", "4 saat": "240", "1 gün": "1D", "1 hafta": "1W", "1 ay": "1M"}
+        codes = []
+        for value in text.split(","):
+            value = value.strip()
+            if not value:
+                continue
+            numeric = re.fullmatch(r"(\d+) (dakika|saat)", value)
+            codes.append(str(int(numeric[1]) * (60 if numeric[2] == "saat" else 1))
+                         if numeric else labels.get(value, value))
+        return codes
+
+    @staticmethod
+    def _timeframe_label(value):
+        from .tradingview import chart_resolution
+        code = chart_resolution(str(value))
+        if code.isdigit():
+            minutes = int(code)
+            return f"{minutes // 60} saat" if minutes and minutes % 60 == 0 else f"{minutes} dakika"
+        return {"D": "1 gün", "W": "1 hafta", "1M": "1 ay"}.get(code, str(value))
+
+    @staticmethod
+    def _friendly_error(exc):
+        detail = str(exc)
+        if "yardımcı işlemi başlatılamadı" in detail:
+            return "TradingView'i bulmak için gereken Windows yardımcı işlemi açılamadı. TradingView.exe yolunu elle seçin; hata kodu teknik ayrıntılarda bulunur."
+        if "Sonuç doğrulanamadı" in detail:
+            return "TradingView sonucu istenen ayarlarla doğrulanamadı. Teknik ayrıntıları inceleyip testi yeniden deneyin."
+        if any(token in detail for token in ("10061", "urlopen", "CDP", "9222")):
+            return "TradingView ile bağlantı kurulamadı. TradingView açıksa kaydedilmemiş işlerinizi koruyarak kapatın; ardından yeniden hazırlayın."
+        if "geçerli timeframe" in detail:
+            return "En az bir zaman dilimi seçin. ‘Zaman dilimi seç’ düğmesini kullanabilirsiniz."
+        return detail
 
     def _page_header(self, title, subtitle):
         Q = self.QtWidgets
@@ -791,7 +1457,15 @@ class StudioWindow:
         box.addWidget(advanced)
         save = Q.QPushButton("Ayarları kaydet", objectName="primary"); save.clicked.connect(self.save_application_settings)
         box.addWidget(save); self.settings_status = Q.QLabel("Telemetri ve bulut bağlantısı kapalıdır.", objectName="status")
-        box.addWidget(self.settings_status); box.addStretch()
+        box.addWidget(self.settings_status)
+        archive = Q.QPushButton("Araştırma arşivi içe aktar (isteğe bağlı)")
+        archive.clicked.connect(self.import_research_archive)
+        box.addWidget(archive)
+        archive_open = Q.QPushButton("İçe aktarılan araştırma arşivini aç")
+        archive_open.clicked.connect(lambda: self._show_auxiliary(5, "İçe aktarılan araştırma arşivi"))
+        archive_open.setEnabled(bool(self.store.app_settings().get("imported_research_catalog")))
+        self.archive_open_button = archive_open
+        box.addWidget(archive_open); box.addStretch()
         settings = self.store.app_settings()
         self.default_timeout.setValue(float(settings.get("timeout", 75)))
         self.default_poll.setValue(float(settings.get("poll_interval", .7)))
@@ -804,9 +1478,19 @@ class StudioWindow:
         page = Q.QWidget()
         box = Q.QVBoxLayout(page)
         box.setContentsMargins(34, 28, 34, 28)
-        box.addWidget(self._page_header("Tarama ayarları", "Kombinasyonları hesaplayın ve tekrar üretilebilir görevler oluşturun."))
+        box.addWidget(self._page_header("Tarama", "Stratejini, test koşullarını ve denenecek değerleri seç."))
+        box.addWidget(self._first_use_help("scan", "Taramayı nasıl ayarlayacağım?",
+            "Sembol seç ile test edeceğiniz piyasayı, Zaman dilimi seç ile grafik aralığını belirleyin. "
+            "Tarih seç ile dönemi sınırlayabilirsiniz; boş bırakınca erişilebilen geçmiş kullanılır.\n"
+            "Ayar tablosunda Sabit tut tek değeri kullanır. Farklı değerleri dene seçip tarama değerlerini düzenleyin: "
+            "örneğin Fast EMA için 7, 8, 9 üç test oluşturur. Gelişmiş ayarlardan maliyet ve başarı ölçütlerini değiştirebilirsiniz.\n"
+            "Alttaki özeti kontrol edin, Hazırla ve başlat seçin. Uygulama ayrı grafiği hazırlar; başlamadan önce değişiklikleri onaylarsınız."))
+        self.connection_status = Q.QLabel("TradingView bağlantısı hazırlık sırasında kontrol edilecek.")
+        self.connection_status.setWordWrap(True)
+        box.addWidget(self.connection_status)
         self.scan_flow_status = Q.QLabel("Proje: eksik · Strateji: eksik · Plan: eksik · Sekmeler: onay gerekli", objectName="status")
         self.scan_flow_status.setWordWrap(True)
+        self.scan_flow_status.hide()  # Internal compatibility; the visible summary is below.
         box.addWidget(self.scan_flow_status)
         context_form = Q.QFormLayout()
         scope_form = Q.QFormLayout()
@@ -823,16 +1507,16 @@ class StudioWindow:
         self.strategy_picker.currentIndexChanged.connect(self.select_plan_strategy)
         find_strategy = Q.QPushButton("Açık stratejiyi bul")
         find_strategy.clicked.connect(self.discover_plan_strategies)
-        self.symbols = Q.QLineEdit(); self.symbols.setPlaceholderText("OANDA:EURUSD, OANDA:GBPUSD")
+        self.symbols = Q.QLineEdit(); self.symbols.setPlaceholderText("Henüz sembol seçilmedi")
         self.symbol_profile = Q.QComboBox(); self.symbol_profile.addItem("Özel")
         self.symbol_profile.addItems(FTMO_SYMBOL_PROFILES.keys())
         self.symbol_profile.currentTextChanged.connect(self.apply_symbol_profile)
-        self.timeframes = Q.QLineEdit(); self.timeframes.setPlaceholderText("15, 1H")
+        self.timeframes = Q.QLineEdit(); self.timeframes.setPlaceholderText("Henüz zaman dilimi seçilmedi")
         self.analysis_timezone = Q.QComboBox()
         self.analysis_timezone.addItems(["UTC", "America/New_York", "Europe/Istanbul"])
         self.analysis_timezone.setCurrentText("America/New_York")
-        self.date_from = Q.QLineEdit(); self.date_from.setPlaceholderText("2025-01-01")
-        self.date_to = Q.QLineEdit(); self.date_to.setPlaceholderText("2025-12-31")
+        self.date_from = Q.QLineEdit(); self.date_from.setPlaceholderText("Başlangıç — isteğe bağlı")
+        self.date_to = Q.QLineEdit(); self.date_to.setPlaceholderText("Bitiş — isteğe bağlı")
         for date_field in (self.date_from, self.date_to):
             date_field.setToolTip(
                 "Özel tarih seçimi plan önizlemesi içindir; TradingView'de otomatik uygulama henüz açık değil."
@@ -841,14 +1525,34 @@ class StudioWindow:
         project_row.addWidget(self.plan_project)
         project_row.addWidget(find_project)
         project_row.addStretch()
-        context_form.addRow("Proje", project_row)
+        context_form.addRow("Strateji", project_row)
         strategy_row = Q.QHBoxLayout(); strategy_row.addWidget(self.strategy_picker); strategy_row.addWidget(find_strategy); strategy_row.addStretch()
-        context_form.addRow("TradingView stratejisi", strategy_row)
+        self.manual_strategy_row = Q.QWidget()
+        self.manual_strategy_row.setLayout(strategy_row)
         symbol_row = Q.QHBoxLayout(); symbol_row.addWidget(self.symbol_profile); symbol_row.addWidget(self.symbols, 1)
-        scope_form.addRow("Sembol profili", symbol_row); scope_form.addRow("Timeframe'ler", self.timeframes)
+        symbol_select = Q.QPushButton("Sembol seç")
+        symbol_select.clicked.connect(self.choose_symbols)
+        symbol_row.addWidget(symbol_select)
+        scope_form.addRow("Semboller", symbol_row)
+        timeframe_row = Q.QHBoxLayout()
+        timeframe_row.addWidget(self.timeframes)
+        timeframe_select = Q.QPushButton("Zaman dilimi seç")
+        timeframe_select.clicked.connect(self.choose_timeframes)
+        timeframe_row.addWidget(timeframe_select)
+        scope_form.addRow("Zaman dilimleri", timeframe_row)
         scope_form.addRow("İşlem analizi saat dilimi", self.analysis_timezone)
         dates = Q.QHBoxLayout(); dates.addWidget(self.date_from); dates.addWidget(self.date_to)
+        date_pick = Q.QPushButton("Tarih seç")
+        date_pick.clicked.connect(self.choose_dates)
+        dates.addWidget(date_pick)
         scope_form.addRow("Tarih aralığı", dates)
+        date_note = Q.QLabel("Boş bırakılırsa grafikte erişilebilen geçmiş kullanılır. Özel tarihler yalnız doğrulanmış tarih desteği varsa çalıştırılır.")
+        date_note.setWordWrap(True)
+        scope_form.addRow(date_note)
+        self.field_errors = Q.QLabel("")
+        self.field_errors.setWordWrap(True)
+        self.field_errors.setStyleSheet(f"color:{STATUS_ERROR}")
+        scope_form.addRow(self.field_errors)
         criteria_frame = Q.QFrame()
         criteria = Q.QGridLayout(criteria_frame)
         self.min_trades = Q.QSpinBox(); self.min_trades.setRange(0, 1_000_000); self.min_trades.setValue(60); self.min_trades.setPrefix("İşlem ≥ ")
@@ -935,7 +1639,9 @@ class StudioWindow:
             "Geçmiş performansın tekrarlanacağı anlamına gelmez."
         )
         self.session_variants_check.toggled.connect(self.preview_plan)
-        box.addWidget(Q.QLabel("Hangi ayarları tarayalım? Varsayılanlar sabit kalır; Tara seçince önerilen değerler kullanılır.", objectName="subtitle"))
+        instructions = Q.QLabel("Hangi ayarları deneyelim? Diğer ayarlar mevcut değerlerinde kalır. Öneriler başlangıç içindir; en iyi değer garantisi değildir.", objectName="subtitle")
+        instructions.setWordWrap(True)
+        box.addWidget(instructions)
         self.auto_excluded_notice = Q.QLabel("", objectName="status")
         self.auto_excluded_notice.setWordWrap(True)
         self.auto_excluded_notice.hide()
@@ -953,19 +1659,20 @@ class StudioWindow:
         self.plan_inputs.setSelectionBehavior(Q.QAbstractItemView.SelectRows)
         self.plan_inputs.horizontalHeader().setStretchLastSection(False)
         self.plan_inputs.horizontalHeader().setSectionResizeMode(4, Q.QHeaderView.Stretch)
-        self.plan_inputs.setColumnWidth(1, 220)
-        self.plan_inputs.setColumnWidth(2, 80); self.plan_inputs.setColumnWidth(3, 125)
+        self.plan_inputs.setColumnWidth(1, 160)
+        self.plan_inputs.setColumnWidth(2, 80); self.plan_inputs.setColumnWidth(3, 190)
         self.plan_inputs.setColumnWidth(4, 200)
         self.plan_inputs.itemDoubleClicked.connect(self.edit_scan_values)
         self.plan_inputs.itemSelectionChanged.connect(self.refresh_input_detail)
-        self.plan_inputs.setMinimumHeight(260)
+        self.plan_inputs.setMinimumHeight(180)
+        self.plan_inputs.setMaximumHeight(360)
         self.plan_inputs.hide()
         input_workspace = Q.QWidget()
-        input_workspace_layout = Q.QHBoxLayout(input_workspace)
+        input_workspace_layout = Q.QVBoxLayout(input_workspace)
         input_workspace_layout.setContentsMargins(0, 0, 0, 0)
         input_workspace_layout.addWidget(self.plan_inputs, 1)
         self.input_detail_panel = Q.QFrame()
-        self.input_detail_panel.setFixedWidth(270)
+        self.input_detail_panel.setMinimumWidth(0)
         self.input_detail_panel.setStyleSheet(
             "QFrame { background:#fffdf8; border:1px solid #ddc9a3; border-radius:6px; }"
             "QLabel { border:0; }"
@@ -1006,6 +1713,10 @@ class StudioWindow:
         detail_layout.addWidget(detail_edit)
         detail_layout.addStretch()
         input_workspace_layout.addWidget(self.input_detail_panel)
+        detail_toggle = DisclosureButton("Seçili ayarın değerlerini düzenle")
+        detail_toggle.toggled.connect(self.input_detail_panel.setVisible)
+        input_workspace_layout.insertWidget(1, detail_toggle)
+        self.input_detail_panel.hide()
         self.input_workspace = input_workspace
         input_workspace.hide()
         box.addWidget(input_workspace, 1)
@@ -1016,13 +1727,25 @@ class StudioWindow:
         scope_box.setContentsMargins(8, 3, 8, 6)
         scope_box.setSpacing(8)
         scope_box.addLayout(scope_form)
-        scope_box.addWidget(self.criteria_toggle)
-        scope_box.addWidget(criteria_frame)
-        scope_box.addWidget(advanced_cost_toggle)
-        scope_box.addWidget(advanced_cost)
-        scope_box.addWidget(self.session_variants_check)
-        box.addWidget(scope_title)
-        box.addWidget(scope_frame)
+        self.scan_advanced = Q.QWidget()
+        advanced_box = Q.QVBoxLayout(self.scan_advanced)
+        advanced_box.addWidget(self.criteria_toggle)
+        advanced_box.addWidget(criteria_frame)
+        advanced_box.addWidget(advanced_cost_toggle)
+        advanced_box.addWidget(advanced_cost)
+        advanced_box.addWidget(self.session_variants_check)
+        advanced_box.addWidget(self.manual_strategy_row)
+        worker_tools = Q.QPushButton("TradingView hazırlık ayrıntıları")
+        worker_tools.clicked.connect(lambda: self._show_auxiliary(3, "TradingView hazırlığı"))
+        advanced_box.addWidget(worker_tools)
+        self.scan_advanced.hide()
+        advanced_toggle = DisclosureButton("Gelişmiş ayarlar")
+        advanced_toggle.toggled.connect(self.scan_advanced.setVisible)
+        scope_box.addWidget(advanced_toggle)
+        scope_box.addWidget(self.scan_advanced)
+        position = box.indexOf(input_workspace)
+        box.insertWidget(position, scope_title)
+        box.insertWidget(position + 1, scope_frame)
         action_bar = Q.QFrame()
         action_layout = Q.QVBoxLayout(action_bar)
         action_layout.setContentsMargins(12, 8, 12, 8)
@@ -1030,12 +1753,20 @@ class StudioWindow:
         actions = Q.QHBoxLayout()
         self.edit_input_button = Q.QPushButton("Seçili aralığı değiştir")
         self.edit_input_button.clicked.connect(self.edit_selected_scan_values)
-        preview = Q.QPushButton("Hesapla", objectName="primary"); preview.clicked.connect(self.preview_plan)
-        enqueue = Q.QPushButton("Görevleri kuyruğa ekle", objectName="primary"); enqueue.clicked.connect(self.enqueue_current_plan)
+        preview = Q.QPushButton("Özeti güncelle"); preview.clicked.connect(self.preview_plan)
+        enqueue = Q.QPushButton("Hazırla ve başlat", objectName="primary"); enqueue.clicked.connect(self.prepare_and_start)
         self.enqueue_plan_button = enqueue
         enqueue.setEnabled(False)
         actions.addWidget(self.edit_input_button); actions.addWidget(preview)
         actions.addWidget(enqueue); actions.addStretch()
+        self.edit_input_button.hide()
+        preview.hide()  # The preview updates as fields change.
+        fix = Q.QPushButton("Eksik alana git")
+        fix.clicked.connect(self.focus_missing_field)
+        actions.addWidget(fix)
+        stop = Q.QPushButton("Durdur")
+        stop.clicked.connect(self.stop_workers)
+        actions.addWidget(stop)
         self.plan_status = Q.QLabel("Bir proje seçin", objectName="status")
         self.plan_status.setWordWrap(True)
         self.plan_factors = Q.QLabel("", objectName="subtitle")
@@ -1064,11 +1795,33 @@ class StudioWindow:
         page = Q.QWidget()
         box = Q.QVBoxLayout(page)
         box.setContentsMargins(34, 28, 34, 28)
-        box.addWidget(self._page_header("Sonuçlar ve hatalar", "Doğrulanmış presetler ve müdahale gerektiren olaylar."))
+        box.addWidget(self._page_header("Sonuçlar", "Tarama ilerlemesini ve doğrulanmış test sonuçlarını inceleyin."))
+        self.results_help_button = Q.QPushButton("Grafikleri nasıl okuyacağım?")
+        self.results_help_button.setToolTip("Grafiklerin anlamını ve sonuç ayrıntılarını açma yöntemini gösterir.")
+        self.results_help_button.clicked.connect(lambda: self.start_guided_tour("results"))
+        box.addWidget(self.results_help_button, 0, QtCore.Qt.AlignLeft)
+        self.results_help_panel = Q.QFrame()
+        help_layout = Q.QVBoxLayout(self.results_help_panel)
+        self.results_help_text = Q.QLabel(
+            "Her nokta bir testtir. Sağa doğru kâr faktörü (PF), yukarı doğru düşüş (DD) artar; "
+            "noktanın büyüklüğü işlem sayısını gösterir. Yeşil, sonucun doğrulandığını belirtir; "
+            "stratejinin başarılı veya gelecekte kârlı olacağını garanti etmez.\n\n"
+            "Bir noktaya tıklayın veya sonuç satırına çift tıklayın: sağda ayrıntılar açılır. "
+            "Sermaye eğrisi ve düşüş grafiği zaman içindeki değişimi; saat, gün ve seans grafikleri "
+            "kapanmış işlemlerin dağılımını gösterir. Günlük takvimde günlerin kâr/zararını inceleyebilirsiniz. "
+            "Grafiklerin üzerine gelerek değerleri okuyun.\n\n"
+            "Filtreler görünen sonuçları daraltır. Dışa aktarırken seçili veya filtrelenmiş kapsamı kontrol edin.")
+        self.results_help_text.setWordWrap(True)
+        help_layout.addWidget(self.results_help_text)
+        self.results_help_dismiss = Q.QPushButton("Anladım")
+        self.results_help_dismiss.clicked.connect(self.dismiss_results_help)
+        help_layout.addWidget(self.results_help_dismiss, 0, QtCore.Qt.AlignRight)
+        self.results_help_panel.hide()  # Guidance now lives in anchored tour popups.
+        box.addWidget(self.results_help_panel)
         controls = Q.QHBoxLayout()
         self.result_project = Q.QComboBox(); self.result_project.setMaximumWidth(260)
         self.result_project.currentIndexChanged.connect(self.refresh_results)
-        self.result_filter = Q.QComboBox(); self.result_filter.addItems(["Başarılı", "Tümü", "dayanıklı", "hassas", "elenmiş", "geçersiz"])
+        self.result_filter = Q.QComboBox(); self.result_filter.addItems(["Tümü", "Başarılı", "dayanıklı", "hassas", "elenmiş", "geçersiz"])
         self.result_filter.setMaximumWidth(160)
         self.result_filter.currentIndexChanged.connect(self.refresh_results)
         filter_button = DisclosureButton("Filtrele")
@@ -1153,6 +1906,14 @@ class StudioWindow:
         self.results_table.setHorizontalHeaderLabels(
             ["Görev", "Sembol", "TF", "Sınıf", "İşlem", "PF", "WR %", "DD %", "Net", "Kanıt"]
         )
+        for column, explanation in {
+            2: "Testin zaman dilimi.",
+            5: "Kâr faktörü: toplam kazancın toplam kayba oranı. Tek başına başarı ölçütü değildir.",
+            6: "Kazançla kapanan işlemlerin yüzdesi.",
+            7: "En yüksek sermayeden sonraki en büyük düşüş yüzdesi.",
+            9: "Doğrulandı: test ayarları ve rapor kontrol edildi; kârlılık garantisi değildir.",
+        }.items():
+            self.results_table.horizontalHeaderItem(column).setToolTip(explanation)
         self.results_table.horizontalHeader().setStretchLastSection(True)
         for column, width in enumerate((95, 145, 46, 80, 55, 55, 62, 62, 88)):
             self.results_table.setColumnWidth(column, width)
@@ -1185,9 +1946,86 @@ class StudioWindow:
         scroll.setWidget(page)
         return scroll
 
+    def show_results_help(self):
+        self.results_help_panel.show()
+
+    def dismiss_results_help(self):
+        self.store.save_app_settings({"results_help_dismissed_v1": True})
+        self.results_help_panel.hide()
+
+    def _first_use_help(self, key, title, text):
+        Q = self.QtWidgets
+        container = Q.QWidget()
+        layout = Q.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        button = Q.QPushButton(title)
+        button.setToolTip("Bu ekranın kullanım ipuçlarını ayrı bir pencerede açar.")
+        layout.addWidget(button, 0, QtCore.Qt.AlignLeft)
+        panel = Q.QFrame()
+        contents = Q.QVBoxLayout(panel)
+        label = Q.QLabel(text)
+        label.setWordWrap(True)
+        label.setTextFormat(QtCore.Qt.PlainText)
+        contents.addWidget(label)
+        dismiss = Q.QPushButton("Anladım")
+        setting = "usage_help_" + key + "_dismissed_v1"
+        def close_help():
+            self.store.save_app_settings({setting: True})
+            panel.hide()
+        dismiss.clicked.connect(close_help)
+        def open_help():
+            self.start_guided_tour(key)
+        button.clicked.connect(open_help)
+        contents.addWidget(dismiss, 0, QtCore.Qt.AlignRight)
+        layout.addWidget(panel)
+        panel.hide()  # Retain legacy text for compatibility, not as a long inline guide.
+        if not hasattr(self, "usage_help"):
+            self.usage_help = {}
+        self.usage_help[key] = (panel, button, dismiss, label)
+        return container
+
+    def start_guided_tour(self, key, automatic=False):
+        setting = "guided_tour_" + key + "_v1"
+        if automatic and (not self.window.isVisible() or self.store.app_settings().get(setting)):
+            return
+        previous = getattr(self, "guided_tour", None)
+        if previous is not None:
+            previous.finish()
+        if key == "strategies":
+            steps = [
+                (self.strategy_list, "Bir strateji seç", "Kayıtlı stratejini buradan seçebilirsin. Yeni strateji eklemek için aşağıdaki adımlarla devam et.", None),
+                (self.pine_source, "Pine kodunu yapıştır", "TradingView strategy kodunu bu alana yapıştır. Ayarlar otomatik okunacak. Kod girilince İleri açılır.", lambda: bool(self.pine_source.toPlainText().strip())),
+                (self.project_name, "Stratejine ad ver", "Bu çalışmayı tanıyacağın bir ad yaz. Kayıtlı strateji seçtiysen mevcut adı kullanabilirsin.", lambda: bool(self.project_name.text().strip())),
+                (self.strategy_save_button, "Stratejiyi kaydet", "Bu düğmeye bas. Aynı kod yeniden kaydedilirse yeni kopya oluşmaz. Kayıt tamamlanınca İleri açılır.", lambda: self._saved_project_id is not None),
+                (self.prepare_saved_button, "Taramaya geç", "Taramayı hazırla düğmesi seni Tarama ekranına götürür. Orada sembol, zaman dilimi ve denenecek değerleri seçeceksin.", None),
+            ]
+        elif key == "scan":
+            steps = [
+                (self.plan_project, "Stratejini kontrol et", "Taranacak strateji burada seçili olmalı.", lambda: self.plan_project.currentData() is not None),
+                (self.symbols, "Sembol seç", "Yanındaki Seç düğmesinden piyasayı ara ve ekle. Örneğin BIST:XU030D1!. Sembol seçilince İleri açılır.", lambda: bool(self.symbols.text().strip())),
+                (self.timeframes, "Zaman dilimi seç", "Yanındaki Seç düğmesiyle örneğin 15 dakika seç. Zaman dilimi seçilince İleri açılır.", lambda: bool(self.timeframes.text().strip())),
+                (self.date_from, "Test dönemini belirle", "Tarih aralığı isteğe bağlıdır. Boş bırakınca erişilebilen geçmiş kullanılır; belirli dönem için başlangıç ve bitiş seç.", None),
+                (self.plan_inputs, "Denenecek ayarı seç", "Fast EMA satırında Farklı değerleri dene seç. Değerleri 7, 8, 9 yaparsan üç kombinasyon oluşur. Diğer ayarları Sabit tut bırakabilirsin.", None),
+                (self.parallel_count, "Paralel grafik sayısını seç", "Bir grafikle başlayabilir veya aynı anda birden fazla test çalıştırabilirsin. Kaynakları ölç öneri verir; hızı Sonuçlar ekranında test/saat olarak ölçeriz. Her grafik bağımsız hazırlanır ve doğrulanır.", None),
+                (self.enqueue_plan_button, "Özeti kontrol edip başlat", "Hazırla ve başlat ayrı test grafiğini hazırlar ve değişiklikleri onayına sunar. Tur bu düğmeye senin yerine basmaz. Eksik varsa Eksik alana git düğmesini kullan.", None),
+            ]
+        else:
+            target = self.usage_help["detail"][1] if key == "detail" else self.results_help_button
+            steps = [(target, "Sonuçları incele", "Her nokta bir testtir. Bir sonucu seçerek testte kullanılan ayarlara, işlem eğrisine ve teknik doğrulamaya bak. Yüksek kâr tek başına güvenilirlik garantisi değildir.", None)]
+            if key == "results":
+                steps.extend([
+                    (self.result_filter, "Sonuçları filtrele", "Tümü veya Başarılı gibi filtrelerle görmek istediğin sonuçları seç. Filtre seçmek kayıtlı sonuçları değiştirmez.", None),
+                    (self.result_scatter, "Bir testi aç", "Her nokta bir testtir. Noktaya tıklayarak kullanılan ayarları ve sonuç ayrıntılarını aç. Yeşil doğrulanmış demektir, gelecekte kâr garantisi değildir.", None),
+                ])
+        def finished():
+            self.store.save_app_settings({setting: True})
+            self.guided_tour = None
+        self.guided_tour = GuidedTour(self.window, steps, finished)
+        self.guided_tour.auto_advance_indices = {3} if key == "strategies" else {1, 2} if key == "scan" else set()
+
     def _research_page(self):
         Q = self.QtWidgets
-        self._research_catalog = load_catalog()
+        self._research_catalog = self.store.app_settings().get("imported_research_catalog") or load_catalog()
         self._visible_research_catalog = self._research_catalog
         research_available = self._research_catalog.get("available", True)
         page = Q.QWidget(); box = Q.QVBoxLayout(page)
@@ -1240,12 +2078,14 @@ class StudioWindow:
         prepare.clicked.connect(self.prepare_research_provider_tasks)
         export_pdf = Q.QPushButton("Araştırma PDF'i")
         export_pdf.clicked.connect(self.export_research_report)
-        export_success = Q.QPushButton("7 başarılıyı CSV/Excel indir")
+        export_success = Q.QPushButton("Arşiv kayıtlarını CSV/Excel indir")
         export_success.clicked.connect(self.export_successful_research_records)
-        export_raw = Q.QPushButton("33.075 ham kaydı indir")
+        export_raw = Q.QPushButton("Yerel ham araştırma kayıtlarını indir")
         export_raw.clicked.connect(self.export_historical_records)
         for control in (prepare, export_pdf, export_success, export_raw):
             control.setEnabled(research_available)
+            control.setVisible(research_available)
+        export_raw.setVisible(False)  # Catalog import excludes separate raw records.
         controls.addWidget(self.research_project)
         controls.addWidget(self.research_provider_symbol, 1)
         controls.addWidget(prepare)
@@ -1263,6 +2103,8 @@ class StudioWindow:
             objectName="status",
         )
         box.addWidget(self.research_status)
+        if self._research_catalog.get("imported_unverified"):
+            self.research_status.setText("İçe aktarılan tarihsel arşiv. Dosyadaki sonuçlar bu uygulamada yeniden doğrulanmadı; kendi testlerinden kaydettiğin presetlerden ayrıdır.")
         self.research_details = Q.QPlainTextEdit(); self.research_details.setReadOnly(True)
         self.research_details.setMinimumHeight(140)
         box.addWidget(self.research_details, 1)
@@ -1371,11 +2213,11 @@ class StudioWindow:
         Q = self.QtWidgets
         path, selected_filter = Q.QFileDialog.getSaveFileName(
             self.window, "33.075 tarihsel ham kaydı dışa aktar",
-            "ftmo-session-33075-ham-kayit.csv", "CSV (*.csv);;Excel (*.xlsx)"
+            "ftmo-session-33075-ham-kayit.xlsx", CSV_FILTERS
         )
         if not path:
             return
-        excel = "Excel" in selected_filter or Path(path).suffix.lower() == ".xlsx"
+        excel = "*.xlsx" in selected_filter if selected_filter else Path(path).suffix.lower() == ".xlsx"
         destination = str(Path(path).with_suffix(".xlsx" if excel else ".csv"))
         try:
             input_ids_seen = {}
@@ -1391,10 +2233,13 @@ class StudioWindow:
                 raise RuntimeError(f"Beklenen 33.075 kayıt yerine {archived_count} kayıt okundu.")
             input_ids = tuple(input_ids_seen)
             writer = export_task_xlsx if excel else export_task_csv
-            count = writer(iter_historical_records(), destination, input_ids)
+            options = {} if excel else {"excel_tr": "Türkçe Excel" in selected_filter}
+            count = writer(iter_historical_records(), destination, input_ids, **options)
             if count != 33_075:
                 raise RuntimeError(f"Beklenen 33.075 kayıt yerine {count} kayıt yazıldı.")
             self.research_status.setText(f"{count:,} gerçek ham tarama kaydı {Path(destination).name} dosyasına kaydedildi.")
+            if options.get("excel_tr"):
+                self.research_status.setText(self.research_status.text() + " Excel sihirbazında UTF-8 ve noktalı virgül ayracını seçin; doğrudan açmak için XLSX kullanın.")
         except Exception as exc:
             self.research_status.setStyleSheet("color:#b54c42")
             self.research_status.setText(f"Ham kayıtlar dışa aktarılamadı: {exc}")
@@ -1402,19 +2247,22 @@ class StudioWindow:
     def export_successful_research_records(self):
         Q = self.QtWidgets
         path, selected_filter = Q.QFileDialog.getSaveFileName(
-            self.window, "Ağır maliyeti geçen 7 preset", "ftmo-7-basarili.csv",
-            "CSV (*.csv);;Excel (*.xlsx)")
+            self.window, "Ağır maliyeti geçen 7 preset", "ftmo-7-basarili.xlsx",
+            CSV_FILTERS)
         if not path:
             return
-        excel = "Excel" in selected_filter or Path(path).suffix.lower() == ".xlsx"
+        excel = "*.xlsx" in selected_filter if selected_filter else Path(path).suffix.lower() == ".xlsx"
         destination = str(Path(path).with_suffix(".xlsx" if excel else ".csv"))
         records = iter(iter_successful_research_records(self._visible_research_catalog))
         first = next(records)
         writer = export_task_xlsx if excel else export_task_csv
         try:
+            options = {} if excel else {"excel_tr": "Türkçe Excel" in selected_filter}
             count = writer(itertools.chain((first,), records), destination,
-                           first["payload"]["inputs"])
+                           first["payload"]["inputs"], **options)
             self.research_status.setText(f"{count} ağır maliyet preseti kaydedildi; sağlayıcı/forward kanıtı ayrıca gösterilir.")
+            if options.get("excel_tr"):
+                self.research_status.setText(self.research_status.text() + " Excel sihirbazında UTF-8 ve noktalı virgül ayracını seçin; doğrudan açmak için XLSX kullanın.")
         except Exception as exc:
             self.research_status.setStyleSheet("color:#b54c42")
             self.research_status.setText(f"Başarılı presetler dışa aktarılamadı: {exc}")
@@ -1477,13 +2325,22 @@ class StudioWindow:
         return page
 
     def find_tradingview(self):
-        found = find_tradingview_executables()
+        try:
+            found = find_tradingview_executables()
+        except Exception as exc:
+            self.worker_status.setStyleSheet(f"color:{STATUS_ERROR}")
+            self.worker_status.setText(self._friendly_error(exc))
+            self.worker_status.setToolTip(str(exc))
+            found = []  # Offer the same explicit file picker after discovery failure.
         if found:
             self.tv_executable.setText(str(found[0]))
+            self.store.save_app_settings({"tradingview_executable": str(found[0])})
             self.worker_status.setText(f"TradingView bulundu · CDP {'hazır' if cdp_healthy() else 'kapalı'}")
         else:
             path, _ = self.QtWidgets.QFileDialog.getOpenFileName(self.window, "TradingView.exe seç", "", "Uygulama (*.exe)")
-            if path: self.tv_executable.setText(path)
+            if path:
+                self.tv_executable.setText(path)
+                self.store.save_app_settings({"tradingview_executable": path})
 
     def open_tradingview(self):
         try:
@@ -1541,7 +2398,11 @@ class StudioWindow:
         page = Q.QWidget()
         box = Q.QVBoxLayout(page)
         box.setContentsMargins(34, 28, 34, 28)
-        box.addWidget(self._page_header("Yeni tarama projesi", "Pine strategy kodunu analiz edin; inputlar kaydetmeden önce görünür."))
+        box.addWidget(self._page_header("Stratejiler", "İlk stratejini ekle veya kayıtlı bir stratejiyle devam et."))
+        box.addWidget(self._first_use_help("strategies", "Nereden başlayacağım?",
+            "Üstteki listeden kayıtlı bir strateji seçin veya Pine strategy kodunuzu aşağıya yapıştırın. "
+            "Ayarlar otomatik okunur. Proje adını girip Stratejiyi kaydet seçin; ardından Taramayı hazırla ile devam edin. "
+            "Aynı kodu tekrar kaydetmek kopya oluşturmaz; ayrı bir çalışma için Kopya oluştur kullanın."))
         self.project_name = Q.QLineEdit()
         self.project_name.setPlaceholderText("Proje adı")
         box.addWidget(self.project_name)
@@ -1550,12 +2411,16 @@ class StudioWindow:
         self.pine_source.setMinimumHeight(230)
         box.addWidget(self.pine_source)
         controls = Q.QHBoxLayout()
-        analyze = Q.QPushButton("Inputları analiz et", objectName="primary")
+        analyze = Q.QPushButton("Ayarları tekrar oku")
         analyze.clicked.connect(self.analyze_source)
-        save = Q.QPushButton("Projeyi kaydet", objectName="primary")
+        save = Q.QPushButton("Stratejiyi kaydet", objectName="primary")
+        self.strategy_save_button = save
         save.clicked.connect(self.save_project)
         controls.addWidget(analyze)
         controls.addWidget(save)
+        copy = Q.QPushButton("Kopya oluştur")
+        copy.clicked.connect(lambda: self.save_project(copy=True))
+        controls.addWidget(copy)
         controls.addStretch()
         box.addLayout(controls)
         self.project_status = Q.QLabel("Pine kodu bekleniyor", objectName="status")
@@ -1563,16 +2428,40 @@ class StudioWindow:
         self.input_table = Q.QTableWidget(0, 9)
         self.input_table.setHorizontalHeaderLabels(["Değişken", "Başlık", "Tür", "Varsayılan", "Seçenekler", "Min/Max/Adım", "Grup", "Tooltip", "Durum"])
         self.input_table.horizontalHeader().setStretchLastSection(True)
+        self.input_table.setEditTriggers(Q.QAbstractItemView.NoEditTriggers)
+        for column in (0, 2, 4, 5, 6, 8):
+            self.input_table.setColumnHidden(column, True)
+        self.input_table.horizontalHeader().setSectionResizeMode(1, Q.QHeaderView.Stretch)
+        self.input_table.horizontalHeader().setSectionResizeMode(7, Q.QHeaderView.Stretch)
+        technical = DisclosureButton("Teknik ayrıntılar")
+        technical.toggled.connect(lambda shown: [self.input_table.setColumnHidden(c, not shown) for c in (0, 2, 4, 5, 6, 8)])
+        box.addWidget(technical)
         box.addWidget(self.input_table, 1)
-        return page
+        self.source_timer = QtCore.QTimer(self.window)
+        self.source_timer.setSingleShot(True)
+        self.source_timer.setInterval(400)
+        self.source_timer.timeout.connect(self.analyze_source)
+        self.pine_source.textChanged.connect(self.source_timer.start)
+        scroll = Q.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(Q.QFrame.NoFrame)
+        scroll.setWidget(page)
+        return scroll
 
     def _show_page(self, index):
+        active_tour = getattr(self, "guided_tour", None)
+        if active_tour is not None:
+            active_tour.finish()
         nav_button = self.nav_group.button(index)
         if nav_button is not None:
             nav_button.setChecked(True)
         if index != 4:
             self.result_detail_dock.hide()
         self.pages.setCurrentIndex(index)
+        tour_key = {1: "strategies", 2: "scan", 4: "results"}.get(index)
+        if tour_key:
+            QtCore.QTimer.singleShot(300, lambda: self.start_guided_tour(tour_key, automatic=True)
+                                     if self.pages.currentIndex() == index else None)
         if index == 0:
             self.refresh_dashboard()
         elif index == 2:
@@ -1599,6 +2488,7 @@ class StudioWindow:
             inputs = parse_strategy_inputs(self.pine_source.toPlainText())
         except ValueError as exc:
             self.project_status.setText(str(exc))
+            self.input_table.setRowCount(0)
             self.project_status.setStyleSheet(f"color:{STATUS_ERROR}")
             return
         self.input_table.setRowCount(len(inputs))
@@ -1618,7 +2508,7 @@ class StudioWindow:
         self.project_status.setText(f"{len(inputs)} input bulundu · {len(inputs) - unresolved} varsayılan hazır · {unresolved} değer ayrıca doğrulanmalı")
         return inputs
 
-    def save_project(self):
+    def save_project(self, _checked=False, *, copy=False):
         name = self.project_name.text().strip()
         source = self.pine_source.toPlainText()
         if not name:
@@ -1630,9 +2520,18 @@ class StudioWindow:
             parse_strategy_inputs(source)
         except ValueError:
             return
-        project_id = self.store.create_project(name, source)
+        project_id, created = self.store.save_unique_project(name, source, copy=copy)
+        self._saved_project_id = project_id
         self.project_status.setStyleSheet(f"color:{STATUS_SUCCESS}")
-        self.project_status.setText(f"Proje kaydedildi · #{project_id}")
+        self.project_status.setText("Strateji kaydedildi. Taramayı hazırlayabilirsiniz." if created else "Bu kod zaten kayıtlı. Mevcut strateji açıldı.")
+        self.prepare_saved_button.setEnabled(True)
+        self.strategy_list.blockSignals(True)
+        self.strategy_list.clear()
+        self.strategy_list.addItem("Yeni strateji ekle", None)
+        for project in self.store.projects():
+            self.strategy_list.addItem(project["name"], project["id"])
+        self.strategy_list.setCurrentIndex(self.strategy_list.findData(project_id))
+        self.strategy_list.blockSignals(False)
         self.refresh_dashboard()
         self.refresh_project_selectors()
 
@@ -1767,9 +2666,10 @@ class StudioWindow:
                 tab_cell.setData(QtCore.Qt.UserRole, target)
                 self.worker_table.setItem(row, 2, tab_cell)
                 project_combo = self.QtWidgets.QComboBox()
+                project_combo.addItem("Atanmadı", None)
                 for project in projects: project_combo.addItem(project["name"], project["id"])
                 remembered = previous.get(target)
-                index = project_combo.findData(remembered[0] if remembered else default_project)
+                index = project_combo.findData(remembered[0] if remembered else default_project if safe else None)
                 if index >= 0: project_combo.setCurrentIndex(index)
                 project_combo.currentIndexChanged.connect(lambda _index, r=row: self.refresh_worker_match(r))
                 self.worker_table.setCellWidget(row, 3, project_combo)
@@ -1876,9 +2776,17 @@ class StudioWindow:
             reader = getattr(self.driver, "strategy_source_hash", None)
             if callable(reader) and target_id in self._safe_worker_targets:
                 try:
-                    opener = getattr(self.driver, "ensure_strategy_source_hash", None)
-                    automatic_source_hash = (opener(target_id, strategy["id"], guard=self._guard_worker_layout)
-                                             if callable(opener) else reader(target_id, strategy["id"]))
+                    saved_reader = getattr(self.driver, "saved_strategy_source_hash", None)
+                    if callable(saved_reader):
+                        self._guard_worker_layout(target_id)
+                        try:
+                            automatic_source_hash = saved_reader(target_id, strategy["id"])
+                        except SourceReadUnavailable:
+                            pass
+                    if automatic_source_hash is None:
+                        opener = getattr(self.driver, "ensure_strategy_source_hash", None)
+                        automatic_source_hash = (opener(target_id, strategy["id"], guard=self._guard_worker_layout)
+                                                 if callable(opener) else reader(target_id, strategy["id"]))
                 except SourceReadUnavailable:
                     pass  # An unavailable editor is not a match or a mismatch.
             if (automatic_source_hash is not None
@@ -1894,9 +2802,12 @@ class StudioWindow:
                     raise ValueError("Kaynak okunurken strateji kimliği değişti; worker bağlanmadı.")
             answer = self.QtWidgets.QMessageBox.Yes if automatic_source_hash else self.QtWidgets.QMessageBox.question(
                 self.window, "Strateji kaynağını kontrol et",
-                "Bu sekmedeki tam Pine kaynağı otomatik doğrulanamadı. "
-                "Bu çalışma sekmesindeki stratejinin projeye yapıştırdığınız kodla aynı "
-                "olduğunu TradingView'de kontrol ettiniz mi?"
+                f"Grafik: {target_cell.text() if target_cell else 'Seçili çalışma grafiği'}\n"
+                f"Grafikteki strateji: {strategy.get('name', 'Adı okunamadı')}\n"
+                f"Kayıtlı strateji: {project['name']}\n\n"
+                "Tam Pine kaynağı otomatik doğrulanamadı. Bu grafikteki stratejinin "
+                "kaynağını kayıtlı strateji koduyla karşılaştırıp aynı olduğunu kontrol ettiniz mi? "
+                "Yalnız ayarların veya adın benzemesi yeterli değildir."
             )
             if answer != self.QtWidgets.QMessageBox.Yes:
                 return
@@ -1914,7 +2825,7 @@ class StudioWindow:
         except (ValueError, TradingViewError) as exc:
             self.worker_status.setStyleSheet(f"color:{STATUS_ERROR}"); self.worker_status.setText(str(exc))
 
-    def start_workers(self):
+    def start_workers(self, _checked=False, *, confirmed=False):
         try:
             if self.driver is None: raise ValueError("Önce çalışma sekmelerini bulun.")
             if self.supervisor and self.supervisor.running:
@@ -1936,7 +2847,7 @@ class StudioWindow:
                         (self.worker_table.item(row, 4).data(QtCore.Qt.UserRole) or {}).get("id"),
                     ))
             if not assignments: raise ValueError("En az bir worker seçin.")
-            answer = self.QtWidgets.QMessageBox.question(
+            answer = self.QtWidgets.QMessageBox.Yes if confirmed else self.QtWidgets.QMessageBox.question(
                 self.window, "Taramayı başlat",
                 f"{len(assignments)} yeni çalışma sekmesinde tarama başlatılsın mı? "
                 "Mevcut canlı grafiklere dokunulmayacak."
@@ -1948,12 +2859,18 @@ class StudioWindow:
                 self.store, self.driver, target_guard=self._worker_target_guard(assignments),
                 download_directory=Path.home() / "Downloads")
             try:
-                supervisor.start(assignments)
+                if confirmed:
+                    supervisor.start(assignments, stop_when_idle=True)
+                else:
+                    supervisor.start(assignments)
             except Exception:
                 if hasattr(self.driver, "target_guard"):
                     self.driver.target_guard = None
                 raise
             self.supervisor = supervisor
+            self._speed_started = time.monotonic()
+            self._speed_baseline = 0
+            self._speed_elapsed = None
             self.worker_status.setStyleSheet(f"color:{STATUS_SUCCESS}")
             self.worker_status.setText(f"{len(assignments)} worker çalışıyor")
         except Exception as exc:
@@ -1980,7 +2897,7 @@ class StudioWindow:
         name = self.driver.layout_name(target_id)
         current = worker_layout_candidates(targets, {target_id: name})
         if current.get(target_id) != expected:
-            raise ValueError("Worker layoutu değişti veya başka sekmeyle çakışıyor; görev uygulanmadı.")
+            raise ValueError("Tarama grafiği değişti veya benzersiz değil: başka sekmeyle çakışıyor; görev uygulanmadı.")
         if self.driver.replay_active(target_id):
             raise ValueError("Worker sekmesinde Bar Replay açık; görev uygulanmadı.")
 
@@ -2048,9 +2965,33 @@ class StudioWindow:
                 )
 
     def stop_workers(self):
+        job = getattr(self, "_preparation_job", None)
+        if job and job.isRunning():
+            job.cancelled.set()
+            self.connection_status.setText("İşlem gerekli: hazırlık durduruluyor; mevcut kayıtlar korunacak.")
+        if getattr(self, "_connection_timer", None) and self._connection_timer.isActive():
+            self._connection_timer.stop()
+            self._preparing = False
+            self.preview_plan()
         if self.supervisor and self.supervisor.running:
             self.supervisor.stop()
             if hasattr(self, "worker_status"): self.worker_status.setText("Workerlar durduruldu")
+
+    def shutdown(self):
+        self._closing = True
+        job = getattr(self, "_preparation_job", None)
+        if job and job.isRunning():
+            job.cancelled.set()
+            job.wait(30000)
+        for timer in self.window.findChildren(QtCore.QTimer):
+            timer.stop()
+        self._preparing = False
+        if self.supervisor and self.supervisor.running:
+            self.supervisor.stop()
+        self.tray.hide()
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self._wheel_filter)
 
     def refresh_worker_states(self):
         if not self.supervisor: return
@@ -2070,6 +3011,27 @@ class StudioWindow:
                     self._notified_worker_errors.add(worker_id)
                     self.notify("Worker müdahalesi gerekiyor", f"Worker {worker_id}: {state.error or 'bilinmeyen hata'}")
         self.refresh_dashboard()
+        if hasattr(self, "connection_status"):
+            project_id = self.plan_project.currentData()
+            tasks = self.store.tasks(project_id) if project_id is not None else []
+            completed = sum(task["status"] == "done" for task in tasks)
+            failed = sum(task["status"] in {"failed", "manual_review", "invalid"} for task in tasks)
+            current = next((task for task in tasks if task["status"] == "running"), None)
+            operation = (f" Şimdi: {current['payload'].get('symbol')} / "
+                f"{self._timeframe_label(current['payload'].get('timeframe', ''))}." if current else "")
+            errors = [state.error for state in self.supervisor.states.values() if state.error]
+            run_label = ("Tarama çalışıyor" if self.supervisor.running else
+                "Tarama tamamlandı" if tasks and completed == len(tasks) else "Tarama durdu")
+            self.connection_status.setText(
+                self._friendly_error(errors[0]) if errors else
+                f"{run_label}: "
+                f"{completed}/{len(tasks)} test tamamlandı; {failed} test işlem gerektiriyor.{operation}")
+            self._refresh_result_progress()
+        if self.pages.currentIndex() == 4:
+            progress_key = (completed, tuple(errors), self.supervisor.running)
+            if progress_key != getattr(self, "_last_run_progress", None):
+                self.refresh_results()
+                self._last_run_progress = progress_key
         if self.pages.currentIndex() == 5:
             self.refresh_research_evidence()
 
@@ -2103,7 +3065,7 @@ class StudioWindow:
         inputs = parse_strategy_inputs(project["pine_source"])
         saved_plan = self.store.settings(project_id) or {}
         self.symbols.setText(", ".join(saved_plan.get("symbols", [])))
-        self.timeframes.setText(", ".join(saved_plan.get("timeframes", [])))
+        self.timeframes.setText(", ".join(self._timeframe_label(tf) for tf in saved_plan.get("timeframes", [])))
         saved_dates = saved_plan.get("date_range") or {}
         self.date_from.setText(saved_dates.get("from", ""))
         self.date_to.setText(saved_dates.get("to", ""))
@@ -2169,6 +3131,7 @@ class StudioWindow:
                 values.setData(QtCore.Qt.UserRole + 1, stored_ui["range"])
             values.setToolTip("Tara seçip 'Seçili aralığı değiştir' düğmesiyle bu öneriyi düzenleyebilirsiniz.")
             self.plan_inputs.setItem(row, 4, values)
+            choice.currentIndexChanged.connect(lambda _index, r=row: self._sync_scan_value_display(r))
             source_cell = self.QtWidgets.QTableWidgetItem(suggestion.source)
             source_cell.setToolTip(suggestion.source)
             self.plan_inputs.setItem(row, 5, source_cell)
@@ -2188,6 +3151,7 @@ class StudioWindow:
             note_cell = self.QtWidgets.QTableWidgetItem(note)
             note_cell.setToolTip(note)
             self.plan_inputs.setItem(row, 6, note_cell)
+            self._sync_scan_value_display(row)
         self.plan_inputs.blockSignals(False)
         assumptions = (saved_plan.get("costs") or {}).get("assumptions") or {}
         scenario = assumptions.get("scenario", next(iter(COST_SCENARIOS)))
@@ -2240,6 +3204,17 @@ class StudioWindow:
         )
         self.preview_plan()
 
+    def _sync_scan_value_display(self, row):
+        choice = self.plan_inputs.cellWidget(row, 3)
+        values = self.plan_inputs.item(row, 4)
+        if choice is None or values is None:
+            return
+        if choice.currentText() == "Tara":
+            selected = values.data(QtCore.Qt.UserRole) or []
+            values.setText(" · ".join(map(str, selected[:8])) + (" …" if len(selected) > 8 else ""))
+        else:
+            values.setText("—")
+
     def refresh_input_detail(self, *_args):
         row = self.plan_inputs.currentRow()
         if row < 0 or row >= self.plan_inputs.rowCount():
@@ -2267,8 +3242,9 @@ class StudioWindow:
         item = self._plan_parsed_inputs[row]
         numeric = (item.kind in {"int", "float"} and not item.options
                    and not item.manual_definition_required)
-        self.input_numeric_range.setVisible(numeric)
-        self.input_detail_edit.setVisible(not numeric)
+        scanning = choice.currentText() == "Tara"
+        self.input_numeric_range.setVisible(numeric and scanning)
+        self.input_detail_edit.setVisible(not numeric and scanning)
         if numeric:
             selected_values = self.plan_inputs.item(row, 4).data(QtCore.Qt.UserRole) or []
             saved_range = self.plan_inputs.item(row, 4).data(QtCore.Qt.UserRole + 1) or {}
@@ -2563,12 +3539,23 @@ class StudioWindow:
                 suggested = self.plan_inputs.item(row, 4).data(QtCore.Qt.UserRole) or []
                 if not suggested:
                     raise ValueError(f"{item.title}: tarama için en az bir değer seçin.")
+                if item.kind in {"int", "float"}:
+                    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in suggested):
+                        raise ValueError(f"{item.title}: geçerli sayısal değerler girin.")
+                    if item.kind == "int" and any(not isinstance(v, int) for v in suggested):
+                        raise ValueError(f"{item.title}: yalnız tam sayılar kullanılabilir.")
+                    if item.minimum is not None and min(suggested) < item.minimum:
+                        raise ValueError(f"{item.title}: en küçük değer {item.minimum}.")
+                    if item.maximum is not None and max(suggested) > item.maximum:
+                        raise ValueError(f"{item.title}: en büyük değer {item.maximum}.")
+                if item.options and any(v not in item.options for v in suggested):
+                    raise ValueError(f"{item.title}: kodda tanımlı seçenekleri kullanın.")
                 values[key] = suggested
         split = lambda text: tuple(value.strip() for value in text.split(",") if value.strip())
         variants = []
         if self.session_variants_check.isChecked():
             symbols = split(self.symbols.text())
-            timeframes = split(self.timeframes.text())
+            timeframes = self._timeframe_codes(self.timeframes.text())
             if len(symbols) != 1 or len(timeframes) != 1:
                 raise ValueError("Birlikte session önerisi için tek sembol ve tek zaman dilimi seçin.")
             project = self.store.project(self.plan_project.currentData())
@@ -2630,7 +3617,7 @@ class StudioWindow:
             )
         return ScanPlan(
             study_id=self.study_id.text().strip(), symbols=split(self.symbols.text()),
-            timeframes=split(self.timeframes.text()), input_values=values, date_range=date_range,
+            timeframes=self._timeframe_codes(self.timeframes.text()), input_values=values, date_range=date_range,
             criteria=success_criteria,
             costs={"assumptions": assumptions, "tradingview_inputs": tradingview_inputs,
                    "input_mapping": input_mapping},
@@ -2642,6 +3629,8 @@ class StudioWindow:
         try:
             plan = self._current_plan()
             count = plan.task_count
+            if hasattr(self, "field_errors"):
+                self.field_errors.clear()
             factors = dict(plan.workload_factors())
             input_product = 1
             input_titles = {self.plan_inputs.item(row, 0).text(): item.title
@@ -2657,7 +3646,7 @@ class StudioWindow:
                 top += f" ve {len(growing_inputs) - 3} diğer input"
             self.plan_factors.setText(
                 f"{factors['symbols']} sembol × {factors['timeframes']} zaman dilimi × "
-                f"{factors['variants']} ayar paketi × {input_product} input birleşimi = {count:,} görev"
+                f"{factors['variants']} ayar paketi × {input_product} ayar birleşimi = {count:,} test"
                 + (f" · En büyük çarpanlar: {top}" if top else " · Değişken input yok")
             )
             self.session_variants_check.setText(
@@ -2676,12 +3665,13 @@ class StudioWindow:
             dates_blocked = bool(plan.date_range) and not (
                 GncZihinDriver.date_range_ready and GncZihinDriver.deep_capture_ready)
             if hasattr(self, "enqueue_plan_button"):
-                self.enqueue_plan_button.setEnabled(count > 0 and selected_strategy and not dates_blocked)
+                waiting = bool(getattr(self, "_connection_timer", None) and self._connection_timer.isActive())
+                self.enqueue_plan_button.setEnabled(count > 0 and not dates_blocked and not self._preparing and not waiting)
             self.plan_status.setStyleSheet("color:#6b4c22")
             ready = (
                 " · strateji kaynağı onaylı" if source_confirmed else
                 " · strateji bulundu, kaynak onayı worker ekranında gerekli" if selected_strategy else
-                " · kuyruğa eklemek için açık stratejiyi seçin"
+                " · TradingView hazırlık sırasında bağlanacak"
             )
             if dates_blocked:
                 ready = (
@@ -2689,6 +3679,9 @@ class StudioWindow:
                     "tarihli görev kuyruğa alınamaz"
                 )
             self.plan_status.setText(f"{count:,} görev · tahmini {disk_text}{duration}{warning}{ready}")
+            if self.cost_scenario.currentText() in {"Orta stres", "Ağır stres"} and not any(
+                    field.value() for field in (self.commission, self.spread, self.slippage)):
+                self.field_errors.setText("Stres senaryosu seçili, fakat tüm maliyetler sıfır. Bu ayarlar maliyet stresi uygulamaz.")
             self.scan_flow_status.setText(
                 f"Proje: hazır · Strateji: {'kaynak onaylı' if source_confirmed else 'yapısal eşleşme' if selected_strategy else 'eksik'} · "
                 f"Plan: {count:,} kombinasyon hazır · Sekmeler: başlatmadan önce kullanıcı onayı"
@@ -2697,7 +3690,12 @@ class StudioWindow:
             if hasattr(self, "enqueue_plan_button"):
                 self.enqueue_plan_button.setEnabled(False)
             self.plan_status.setStyleSheet("color:#b54c42"); self.plan_status.setText(str(exc))
-            self.plan_factors.clear()
+            lengths = [len(self.plan_inputs.item(r, 4).data(QtCore.Qt.UserRole) or [])
+                       if self.plan_inputs.cellWidget(r, 3).currentText() == "Tara" else 1
+                       for r in range(self.plan_inputs.rowCount())]
+            self.plan_factors.setText(f"Ayar birleşimi: {math.prod(lengths) if lengths else 0}. Sembol ve zaman dilimleri tamamlandığında toplam test sayısı hesaplanır.")
+            if hasattr(self, "field_errors"):
+                self.field_errors.setText(str(exc))
             self.scan_flow_status.setText("Proje/strateji/plan: eksik bilgiyi tamamlayın · Sekmeler: onay gerekli")
 
     def enqueue_current_plan(self):
@@ -2797,8 +3795,51 @@ class StudioWindow:
                 control.blockSignals(was_blocked)
         self.refresh_results()
 
+    def _refresh_result_progress(self):
+        if not hasattr(self, "run_progress"):
+            return
+        project_id = self.result_project.currentData()
+        tasks = self.store.tasks(project_id) if project_id is not None else []
+        active = bool(self.supervisor and self.supervisor.running and
+                      project_id == self.plan_project.currentData())
+        errors = ([state.error for state in self.supervisor.states.values() if state.error]
+                  if self.supervisor and project_id == self.plan_project.currentData() else [])
+        completed = sum(task["status"] == "done" for task in tasks)
+        failed = sum(task["status"] in {"failed", "manual_review", "invalid"} for task in tasks)
+        label = ("Tarama çalışıyor" if active else
+                 "Tarama tamamlandı" if tasks and completed == len(tasks) else "Tarama durdu")
+        current = next((task for task in tasks if task["status"] == "running"), None)
+        operation = (f" Şimdi: {current['payload'].get('symbol')} / "
+                     f"{self._timeframe_label(current['payload'].get('timeframe', ''))}."
+                     if active and current else "")
+        self.run_progress.setText(self._friendly_error(errors[0]) if errors else
+            f"{label}: {completed}/{len(tasks)} test tamamlandı; {failed} test işlem gerektiriyor.{operation}"
+            if tasks else "Bu stratejide henüz tarama başlatılmadı.")
+        self.run_progress.setToolTip("\n".join(errors))
+        self.parallel_count.setEnabled(not bool(getattr(self, "_preparing", False) or (self.supervisor and self.supervisor.running)))
+        if hasattr(self, "_speed_started") and self.supervisor and project_id == self.plan_project.currentData():
+            if not self.supervisor.running and self._speed_elapsed is None:
+                self._speed_elapsed = time.monotonic() - self._speed_started
+            elapsed = self._speed_elapsed if self._speed_elapsed is not None else time.monotonic() - self._speed_started
+            done = sum(state.completed for state in self.supervisor.states.values()) - self._speed_baseline
+            rate = f"{done * 3600 / elapsed:.0f} test/saat (ölçülen)" if done > 0 and elapsed > 0 else "ölçüm bekleniyor"
+            graphs = sum(state.status in {"starting", "running", "restarting", "idle"} for state in self.supervisor.states.values()) if active else 0
+            self.run_performance.setText(f"Hız: {rate} · aktif grafik: {graphs} · bu çalışmada tamamlanan: {done}")
+        else:
+            self.run_performance.setText("Hız: ölçüm bekleniyor · aktif grafik: 0")
+
+    def measure_parallel_resources(self):
+        try:
+            snapshot = system_snapshot()
+            recommendation = recommend_workers(snapshot)
+            self.parallel_recommendation.setText(f"Kaynak önerisi: {recommendation.recommended} grafik · boş RAM {snapshot.available_memory_bytes / 1024**3:.1f} GB")
+        except Exception as exc:
+            self.parallel_recommendation.setText("Kaynaklar ölçülemedi.")
+            self.parallel_recommendation.setToolTip(str(exc))
+
     def refresh_results(self, *_args):
         project_id = self.result_project.currentData()
+        self._refresh_result_progress()
         self.refresh_saved_result_filters(project_id)
         classification = self.result_filter.currentText() if hasattr(self, "result_filter") else "Tümü"
         # Keep the unfiltered result count for an honest empty state: a project
@@ -2839,9 +3880,15 @@ class StudioWindow:
         self.result_retry_button.setEnabled(project_id is not None)
         self.results_table.setSortingEnabled(False)
         self.results_table.setRowCount(len(rows))
+        project = self.store.project(project_id) if project_id is not None else None
+        parsed = parse_strategy_inputs(project["pine_source"]) if project else []
         for row_index, row in enumerate(rows):
             payload, metrics = row["payload"], row["metrics"]
-            values = (row["task_key"][:12], payload.get("symbol"), payload.get("timeframe"),
+            differences = [f"{item.title}: {payload.get('inputs', {}).get(f'in_{index}')}"
+                for index, item in enumerate(parsed) if f'in_{index}' in payload.get('inputs', {})
+                and payload['inputs'][f'in_{index}'] != item.default]
+            name = ", ".join(differences) if differences else "Varsayılan ayarlar"
+            values = (name, payload.get("symbol"), self._timeframe_label(payload.get("timeframe", "")),
                       row["classification"], metrics.get("trades"), metrics.get("profit_factor"),
                       metrics.get("win_rate_pct"), metrics.get("max_drawdown_pct"),
                       metrics.get("net_profit"), "Doğrulandı" if row["verified"] else "İncele")
@@ -2849,6 +3896,8 @@ class StudioWindow:
                 cell = self.QtWidgets.QTableWidgetItem()
                 cell.setData(QtCore.Qt.DisplayRole, value if value is not None else "—")
                 cell.setData(QtCore.Qt.UserRole, row["task_id"])
+                if column == 0:
+                    cell.setToolTip("Teknik kayıt kimliği: " + row["task_key"])
                 if 4 <= column <= 8:
                     cell.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
                 if column == 9:
@@ -2884,12 +3933,18 @@ class StudioWindow:
         self.result_empty.setText(empty_message)
         self.update_result_actions()
         events = self.store.events(100)
+        if project_id is not None:
+            task_ids = {task["id"] for task in self.store.tasks(project_id)}
+            events = [event for event in events if event["task_id"] in task_ids]
         self.result_events_empty.setVisible(not events)
         self.events_table.setVisible(bool(events))
         self.events_table.setRowCount(len(events))
         for row_index, event in enumerate(events):
             for column, value in enumerate((event["level"], event["worker_id"], event["task_id"], event["message"], event["screenshot_path"])):
-                self.events_table.setItem(row_index, column, self.QtWidgets.QTableWidgetItem(str(value if value is not None else "—")))
+                cell = self.QtWidgets.QTableWidgetItem(str(self._friendly_error(value) if column == 3 else value if value is not None else "—"))
+                if column == 3:
+                    cell.setToolTip("Teknik ayrıntılar:\n" + str(value))
+                self.events_table.setItem(row_index, column, cell)
 
     def refresh_saved_result_filters(self, project_id):
         presets = ((self.store.settings(project_id) or {}).get("result_filters") or {}) if project_id else {}
@@ -3030,6 +4085,9 @@ class StudioWindow:
         expand.clicked.connect(self.toggle_result_detail_size)
         self.result_detail_expand = expand
         layout.addWidget(expand)
+        save_preset = self.QtWidgets.QPushButton("Bu testi preset olarak kaydet")
+        save_preset.clicked.connect(lambda: self.save_local_preset(task_id))
+        layout.addWidget(save_preset)
         scope = self.QtWidgets.QLabel(
             "Risk göstergeleri kapanmış işlemlerden hesaplandı; FTMO gün içi açık pozisyon equity ihlalinin kanıtı değildir."
         )
@@ -3054,6 +4112,47 @@ class StudioWindow:
             layout.addWidget(cost_note)
         tabs = self.QtWidgets.QTabWidget()
         tabs.tabBar().setUsesScrollButtons(True)
+        payload = row.get("payload") or {}
+        project = self.store.project(self.result_project.currentData())
+        parsed = parse_strategy_inputs(project["pine_source"]) if project else []
+        definitions = {f"in_{i}": item for i, item in enumerate(parsed)}
+        inputs = payload.get("inputs") or {}
+        preset_page = self.QtWidgets.QWidget()
+        preset_layout = self.QtWidgets.QVBoxLayout(preset_page)
+        preset_note = self.QtWidgets.QLabel(
+            "Preset, bu testte kullanılan ayar paketidir. Denenen değerler test kaydından; "
+            "varsayılanlar şu an kayıtlı Pine kodundan okunur. Farklı ayarlar aşağıda belirtilir; "
+            "kaydı olmayan bir değer varsayılmaz.")
+        preset_note.setWordWrap(True)
+        preset_layout.addWidget(preset_note)
+        self.result_preset_table = self.QtWidgets.QTableWidget(len(inputs), 4)
+        self.result_preset_table.setHorizontalHeaderLabels(["Ayar", "Varsayılan", "Bu test", "Fark"])
+        for column, width in enumerate((90, 65, 65, 65)):
+            self.result_preset_table.setColumnWidth(column, width)
+        self.result_preset_table.setEditTriggers(self.QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.result_preset_table.horizontalHeader().setStretchLastSection(True)
+        for line, (key, value) in enumerate(inputs.items()):
+            item = definitions.get(key)
+            values = (item.title if item else "Tanımı bulunamayan ayar", item.default if item else "Bilinmiyor",
+                      value, "Farklı" if item and value != item.default else "Aynı" if item else "Karşılaştırılamıyor")
+            for column, rendered in enumerate(values):
+                cell = self.QtWidgets.QTableWidgetItem(str(rendered))
+                cell.setToolTip((item.tooltip or item.title) if item else "Teknik ayar kimliği: " + key)
+                self.result_preset_table.setItem(line, column, cell)
+        preset_layout.addWidget(self.result_preset_table)
+        if not inputs:
+            preset_layout.addWidget(self.QtWidgets.QLabel("Bu sonuçta ayar değerleri kaydedilmemiş."))
+        preset_layout.addWidget(self._first_use_help("detail", "Bu ayrıntıları nasıl kullanacağım?",
+            "Preset sekmesinde denenen ayarları karşılaştırın. Equity ve DD sekmesinde sermaye ve düşüşü, "
+            "Saat/Gün/Session sekmelerinde kapanmış işlemlerin dağılımını inceleyin. "
+            "Input hassasiyeti yalnız karşılaştırılabilir komşu testleri gösterir. "
+            "Grafikleri büyük aç ile paneli büyütün; grafiklerin üzerine gelerek değerleri okuyun. "
+            "Yeni değerleri denemek için Tarama ekranına dönüp Farklı değerleri dene seçin; bu panel sonucu değiştirmez."))
+        preset_scroll = self.QtWidgets.QScrollArea()
+        preset_scroll.setWidgetResizable(True)
+        preset_scroll.setFrameShape(self.QtWidgets.QFrame.NoFrame)
+        preset_scroll.setWidget(preset_page)
+        tabs.addTab(preset_scroll, "Preset ve ayarlar")
         curve_page = self.QtWidgets.QWidget()
         curve_layout = self.QtWidgets.QVBoxLayout(curve_page)
         reported_curve = metrics.get("equity_curve") or []
@@ -3274,18 +4373,21 @@ class StudioWindow:
 
         excel = format_choice.currentText().startswith("Excel")
         suffix = "xlsx" if excel else "csv"
-        destination, _ = Q.QFileDialog.getSaveFileName(
+        destination, selected_filter = Q.QFileDialog.getSaveFileName(
             self.window, "Tarama kayıtlarını kaydet", f"tv-scan-results.{suffix}",
-            "Excel (*.xlsx)" if excel else "CSV (*.csv)")
+            "Excel (*.xlsx)" if excel else CSV_FILTERS.replace("Excel (*.xlsx);;", ""))
         if destination:
             count = export_project_task_scope(
                 self.store, project_id, destination, successful=successful,
-                visible_ids=visible_ids, excel=excel,
+                visible_ids=visible_ids, excel=excel, excel_tr="Türkçe Excel" in selected_filter,
             )
             if not count:
                 Q.QMessageBox.information(self.window, "Dışa aktar", "Bu kapsamda kaydedilecek görev yok.")
                 return
-            Q.QMessageBox.information(self.window, "Dışa aktar", f"{count} görev kaydedildi.")
+            message = f"{count} görev kaydedildi."
+            if not excel and "Türkçe Excel" in selected_filter:
+                message += " Excel sihirbazında UTF-8 ve noktalı virgül ayracını seçin; doğrudan açmak için XLSX kullanın."
+            Q.QMessageBox.information(self.window, "Dışa aktar", message)
 
     def export_current_report(self):
         project_id = self.result_project.currentData()
@@ -3512,6 +4614,13 @@ def ui_smoke_test() -> int:
                     return 2
             if studio.pages.count() != 7:
                 return 2
+            from .historical_dialog import HistoricalDialog
+            historical = HistoricalDialog(studio.store, studio.window)
+            historical.show()
+            application.processEvents()
+            if not historical.table.isVisible() or historical.export_button.isEnabled():
+                return 2
+            historical.close()
         finally:
             studio.worker_timer.stop()
             studio.tray.hide()
@@ -3523,6 +4632,15 @@ def ui_smoke_test() -> int:
 
 
 def main() -> int:
+    if "--helper-self-test" in sys.argv:
+        from .processes import run_hidden
+        try:
+            result = run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                 "[Console]::Write('helper-ok')"],
+                                capture_output=True, text=True, timeout=15, check=False)
+            return 0 if result.returncode == 0 and result.stdout == "helper-ok" else 2
+        except (OSError, __import__('subprocess').SubprocessError):
+            return 2
     if "--ui-smoke-test" in sys.argv:
         return ui_smoke_test()
     if "--self-test" in sys.argv:
@@ -3548,6 +4666,7 @@ def main() -> int:
                 return 2
         return 0
     application = QtWidgets.QApplication(sys.argv)
+    application.setWindowIcon(QtGui.QIcon(str(Path(__file__).parent / "assets" / "app-icon.ico")))
     application.setStyleSheet(STYLE)
     with desktop_instance() as acquired:
         if not acquired:

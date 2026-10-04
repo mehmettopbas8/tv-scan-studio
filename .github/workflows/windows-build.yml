@@ -20,6 +20,8 @@ permissions:
 jobs:
   test-and-build:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +34,18 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - name: Read release version
+        id: metadata
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+        run: |
+          $version = python tools/build_release.py --print-version
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read release version' }
+          if ($env:RELEASE_TAG.StartsWith('v') -and $env:RELEASE_TAG -ne "v$version") {
+            throw 'Tag must match the package version'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
       - name: Install
         run: python -m pip install -e ".[dev]"
       - name: Test
@@ -45,8 +59,10 @@ jobs:
         if: matrix.python-version == '3.13'
         shell: pwsh
         run: |
-          $process = Start-Process -FilePath "dist/TV-Scan-Studio.exe" -ArgumentList "--self-test" -Wait -PassThru -WindowStyle Hidden
-          if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "Portable self-test failed: $($process.ExitCode)" }
+          foreach ($argument in @('--helper-self-test', '--self-test')) {
+            $process = Start-Process -FilePath "dist/TV-Scan-Studio.exe" -ArgumentList $argument -Wait -PassThru -WindowStyle Hidden
+            if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "Portable $argument failed: $($process.ExitCode)" }
+          }
       - name: Verify embedded single-file payload
         if: matrix.python-version == '3.13'
         run: >-
@@ -64,14 +80,15 @@ jobs:
           if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "Portable UI smoke failed: $($process.ExitCode)" }
       - name: Package and checksum
         if: matrix.python-version == '3.13'
-        run: python tools/build_release.py dist/TV-Scan-Studio.exe --output dist --version 0.2.0
+        run: python tools/build_release.py dist/TV-Scan-Studio.exe --output dist
       - name: Verify portable archive
         if: matrix.python-version == '3.13'
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          $archive = "dist/TV-Scan-Studio-0.2.0-portable.zip"
+          $archive = "dist/TV-Scan-Studio-${env:RELEASE_VERSION}-portable.zip"
           $checksum = (Get-Content "$archive.sha256").Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
           $actual = (Get-FileHash $archive -Algorithm SHA256).Hash
           if ($checksum -ne $actual) { throw "Portable ZIP SHA-256 mismatch" }
@@ -91,7 +108,7 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath "dist/release-check"
           $exe = "dist/release-check/TV-Scan-Studio/TV-Scan-Studio.exe"
           $sourceHash = (Get-FileHash "dist/TV-Scan-Studio.exe" -Algorithm SHA256).Hash
-          $directExe = 'dist/TV-Scan-Studio-0.2.0.exe'
+          $directExe = "dist/TV-Scan-Studio-${env:RELEASE_VERSION}.exe"
           $directChecksum = (Get-Content "$directExe.sha256").Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
           if ((Get-FileHash $directExe -Algorithm SHA256).Hash -ne $sourceHash -or $directChecksum -ne $sourceHash) {
             throw 'Direct EXE checksum mismatch'
@@ -99,7 +116,7 @@ jobs:
           if ((Get-FileHash $exe -Algorithm SHA256).Hash -ne $sourceHash) {
             throw "Extracted EXE differs from tested EXE"
           }
-          foreach ($argument in @("--self-test", "--ui-smoke-test")) {
+          foreach ($argument in @("--helper-self-test", "--self-test", "--ui-smoke-test")) {
             $process = Start-Process -FilePath $exe -ArgumentList $argument -Wait -PassThru -WindowStyle Hidden
             if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "Extracted EXE failed $argument" }
           }
@@ -108,10 +125,10 @@ jobs:
         with:
           name: TV-Scan-Studio-windows-x64
           path: |
-            dist/TV-Scan-Studio-0.2.0.exe
-            dist/TV-Scan-Studio-0.2.0.exe.sha256
-            dist/TV-Scan-Studio-0.2.0-portable.zip
-            dist/TV-Scan-Studio-0.2.0-portable.zip.sha256
+            dist/TV-Scan-Studio-${{ steps.metadata.outputs.version }}.exe
+            dist/TV-Scan-Studio-${{ steps.metadata.outputs.version }}.exe.sha256
+            dist/TV-Scan-Studio-${{ steps.metadata.outputs.version }}-portable.zip
+            dist/TV-Scan-Studio-${{ steps.metadata.outputs.version }}-portable.zip.sha256
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
     needs: test-and-build
@@ -129,13 +146,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          RELEASE_VERSION: ${{ needs.test-and-build.outputs.version }}
         run: |
           $releaseArgs = @(
             'release', 'create', $env:RELEASE_TAG,
-            'dist/TV-Scan-Studio-0.2.0.exe',
-            'dist/TV-Scan-Studio-0.2.0.exe.sha256',
-            'dist/TV-Scan-Studio-0.2.0-portable.zip',
-            'dist/TV-Scan-Studio-0.2.0-portable.zip.sha256',
+            "dist/TV-Scan-Studio-${env:RELEASE_VERSION}.exe",
+            "dist/TV-Scan-Studio-${env:RELEASE_VERSION}.exe.sha256",
+            "dist/TV-Scan-Studio-${env:RELEASE_VERSION}-portable.zip",
+            "dist/TV-Scan-Studio-${env:RELEASE_VERSION}-portable.zip.sha256",
             '--verify-tag', '--title', "TV Scan Studio $env:RELEASE_TAG"
           )
           if ($env:RELEASE_TAG.Contains('-')) {

@@ -1,6 +1,18 @@
 import sys
+from pathlib import Path
 
 from tv_scan_studio import app
+
+
+def test_application_icon_is_available_and_decodable(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = app.QtWidgets.QApplication.instance() or app.QtWidgets.QApplication([])
+    icon_path = Path(app.__file__).parent / "assets" / "app-icon.ico"
+    assert icon_path.is_file()
+    icon = app.QtGui.QIcon(str(icon_path))
+    assert not icon.isNull()
+    for size in (16, 32, 48, 256):
+        assert not icon.pixmap(size, size).isNull()
 
 
 def test_packaged_self_test_contract(tmp_path, monkeypatch):

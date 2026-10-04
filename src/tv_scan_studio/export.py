@@ -12,6 +12,19 @@ from typing import Any, Iterable
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+CSV_FILTERS = "Excel (*.xlsx);;Türkçe Excel CSV (*.csv);;Standart CSV (*.csv)"
+
+
+def _csv_value(value: Any, excel_tr: bool) -> Any:
+    """Localize typed scalars only; never rewrite JSON, identifiers or text."""
+    if not excel_tr:
+        return value
+    if isinstance(value, bool):
+        return "DOĞRU" if value else "YANLIŞ"
+    if isinstance(value, float) and math.isfinite(value):
+        return str(value).replace(".", ",")
+    return value
+
 
 def export_results_csv(rows: Iterable[dict[str, Any]], destination: str | Path) -> int:
     """Write result rows with stable columns and flattened payload/metrics."""
@@ -110,7 +123,7 @@ def flatten_task_record(row: dict[str, Any], input_ids: Iterable[str]) -> dict[s
 
 
 def export_task_csv(records: Iterable[dict[str, Any]], destination: str | Path,
-                    input_ids: Iterable[str]) -> int:
+                    input_ids: Iterable[str], *, excel_tr: bool = False) -> int:
     """Stream all requested task rows without materializing the scan universe."""
     input_ids = tuple(input_ids)
     columns = task_export_columns(input_ids)
@@ -118,17 +131,20 @@ def export_task_csv(records: Iterable[dict[str, Any]], destination: str | Path,
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=columns)
+        # Do not add Excel's sep directive: some releases bypass Unicode
+        # detection when it is present. The import wizard can select ';'.
+        writer = csv.DictWriter(stream, fieldnames=columns, delimiter=";" if excel_tr else ",")
         writer.writeheader()
         for record in records:
-            writer.writerow(flatten_task_record(record, input_ids))
+            writer.writerow({key: _csv_value(value, excel_tr) for key, value in
+                             flatten_task_record(record, input_ids).items()})
             count += 1
     return count
 
 
 def export_project_task_scope(store, project_id: int, destination: str | Path, *,
                               successful: bool = False, visible_ids: set[int] | None = None,
-                              excel: bool = False) -> int:
+                              excel: bool = False, excel_tr: bool = False) -> int:
     """Export a selected project scope with every observed input column.
 
     The first pass discovers the schema only; the second streams rows to disk.
@@ -155,7 +171,8 @@ def export_project_task_scope(store, project_id: int, destination: str | Path, *
         if not count:
             return 0
         writer = export_task_xlsx if excel else export_task_csv
-        written = writer(selected(connection), destination, sorted(input_ids))
+        options = {} if excel else {"excel_tr": excel_tr}
+        written = writer(selected(connection), destination, sorted(input_ids), **options)
         if written != count:
             raise RuntimeError("Dışa aktarma sırasında görev sayısı değişti; dosyayı doğrulayın.")
         return written
@@ -187,12 +204,16 @@ def _xlsx_sheet(stream, records: Iterable[dict[str, Any]], columns: list[str],
     prefix = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
               '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
               '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
-              'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetData>')
+              'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>')
+    widths = "".join(f'<col min="{index}" max="{index}" width="{_xlsx_width(column)}" customWidth="1"/>'
+                     for index, column in enumerate(columns, 1))
+    prefix += f'<cols>{widths}</cols><sheetData>'
     stream.write(prefix.encode("utf-8"))
     def write_row(number: int, values: Iterable[Any], *, header: bool = False) -> None:
         cells = "".join(_xlsx_cell(f"{_column_name(index)}{number}", value, header=header)
                         for index, value in enumerate(values, 1))
-        stream.write(f'<row r="{number}">{cells}</row>'.encode("utf-8"))
+        height = ' ht="30" customHeight="1"' if header else ""
+        stream.write(f'<row r="{number}"{height}>{cells}</row>'.encode("utf-8"))
 
     write_row(1, columns, header=True)
     count = 0
@@ -203,6 +224,16 @@ def _xlsx_sheet(stream, records: Iterable[dict[str, Any]], columns: list[str],
            '</worksheet>')
     stream.write(end.encode("utf-8"))
     return count
+
+
+def _xlsx_width(column: str) -> int:
+    if column.endswith("_json") or column == "error":
+        return 48
+    if column == "task_key":
+        return 28
+    if column in {"started_at", "finished_at", "period_timezone", "classification"}:
+        return 30
+    return max(16, min(28, len(column) + 4))
 
 
 def export_task_xlsx(records: Iterable[dict[str, Any]], destination: str | Path,
@@ -284,6 +315,6 @@ _XLSX_STYLES = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
                 '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
                 '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
-                '<xf numFmtId="0" fontId="1" fillId="1" borderId="0" xfId="0" applyFill="1" applyFont="1"/></cellXfs>'
+                '<xf numFmtId="0" fontId="1" fillId="1" borderId="0" xfId="0" applyFill="1" applyFont="1" applyAlignment="1"><alignment wrapText="1" vertical="center"/></xf></cellXfs>'
                 '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
                 '</styleSheet>')

@@ -28,7 +28,7 @@ def test_live_smoke_rejects_duplicate_layout_ids_before_worker(monkeypatch):
     monkeypatch.setattr(smoke, "chart_targets", lambda **_kwargs: [
         {"id": "first", "url": "https://www.tradingview.com/chart/Same/"},
         {"id": "second", "url": "https://www.tradingview.com/chart/Same/"}])
-    with pytest.raises(ValueError, match="benzersiz"):
+    with pytest.raises(SystemExit, match="İki ayrı"):
         smoke.main()
 
 

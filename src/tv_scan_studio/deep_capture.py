@@ -27,6 +27,7 @@ class DeepCapture:
     target_id: str
     study_id: str
     chart_timezone: str
+    symbol_identity: dict[str, Any] | None = None
 
 
 def _assert_chart_task(snapshot: StrategySnapshot, expected: dict[str, Any]) -> None:
@@ -39,7 +40,7 @@ def _assert_chart_task(snapshot: StrategySnapshot, expected: dict[str, Any]) -> 
             return type(observed) is type(value) and observed == value
         return observed == value
 
-    if (snapshot.status_type != 2 or not symbol_matches(expected["symbol"], snapshot.symbol)
+    if (snapshot.status_type != 2 or not symbol_matches(expected["symbol"], snapshot.symbol, snapshot.symbol_identity)
             or snapshot.timeframe != chart_resolution(expected["timeframe"])
             or any(not input_matches(key, value)
                    for key, value in expected.get("inputs", {}).items())):
@@ -48,7 +49,7 @@ def _assert_chart_task(snapshot: StrategySnapshot, expected: dict[str, Any]) -> 
 
 def _wait_chart_task(driver: Any, target_id: str, study_id: str,
                      expected: dict[str, Any], guard: Callable[[str], None],
-                     *, timeout: float = 10) -> None:
+                     *, timeout: float = 10) -> StrategySnapshot:
     """Allow brief TradingView calculation status changes, never a wrong identity."""
     deadline = time.monotonic() + timeout
     while True:
@@ -57,7 +58,7 @@ def _wait_chart_task(driver: Any, target_id: str, study_id: str,
         # Wrong symbol, timeframe or input is never a transient calculation state.
         _assert_chart_task(replace(snapshot, status_type=2), expected)
         if snapshot.status_type == 2:
-            return
+            return snapshot
         if time.monotonic() >= deadline:
             _assert_chart_task(snapshot, expected)
         time.sleep(0.25)
@@ -101,7 +102,7 @@ def capture_task_deep_export(driver: Any, *, target_id: str, study_id: str,
     if not _DOWNLOAD_LOCK.acquire(timeout=timeout):
         raise DeepExportError("Başka workerın XLSX indirmesi sürüyor.")
     try:
-        _wait_chart_task(driver, target_id, study_id, expected, guard)
+        chart_before = _wait_chart_task(driver, target_id, study_id, expected, guard)
         zone = driver.chart_timezone(target_id)
         guard(target_id)
         cost_before = driver.strategy_properties_ui_state(target_id)
@@ -122,7 +123,10 @@ def capture_task_deep_export(driver: Any, *, target_id: str, study_id: str,
             download_directory, baseline=baseline, started_ns=started_ns, timeout=timeout,
         )
         report = read_deep_export(path, downloaded_after_ns=started_ns)
-        _wait_chart_task(driver, target_id, study_id, expected, guard)
+        chart_after = _wait_chart_task(driver, target_id, study_id, expected, guard)
+        if (chart_before.symbol != chart_after.symbol or
+                chart_before.symbol_identity != chart_after.symbol_identity):
+            raise DeepExportError("Worker sembol kimliği indirme sırasında değişti.")
         if driver.chart_timezone(target_id) != zone:
             raise DeepExportError("Worker chart saat dilimi indirme sırasında değişti.")
         guard(target_id)
@@ -139,11 +143,12 @@ def capture_task_deep_export(driver: Any, *, target_id: str, study_id: str,
             cost_assumptions=expected.get("costs", {}).get("assumptions", {}),
             ui_metrics=ui_after.metrics, ui_date_label=ui_after.date_label,
             ui_update_pending=ui_after.update_pending,
+            symbol_identity=chart_after.symbol_identity,
         )
         verified = verify_deep_input_values(
             report, pine_source=pine_source, expected_inputs=expected.get("inputs", {}),
             changed_input_ids=changed_input_ids,
         )
-        return DeepCapture(report, trades, verified, target_id, study_id, zone)
+        return DeepCapture(report, trades, verified, target_id, study_id, zone, chart_after.symbol_identity)
     finally:
         _DOWNLOAD_LOCK.release()

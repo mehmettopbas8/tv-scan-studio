@@ -69,6 +69,18 @@ def test_deep_chart_check_distinguishes_minute_from_monthly():
         deep_capture._assert_chart_task(monthly, expected)
 
 
+def test_deep_chart_accepts_bist_alias_only_with_current_series_identity():
+    expected = {"symbol": "BIST:XU030D1!", "timeframe": "15", "inputs": {"in_1": 9}}
+    snapshot = StrategySnapshot("BIST_DLY:XU030D1!", "15", 2, {"in_1": 9}, {}, {},
+        symbol_identity={"full_name": "BIST_DLY:XU030D1!", "pro_name": "BIST:XU030D1!",
+                         "name": "XU030D1!", "exchange": "BIST"})
+    deep_capture._assert_chart_task(snapshot, expected)
+    for identity in (None, dict(snapshot.symbol_identity, exchange="OANDA"),
+                     dict(snapshot.symbol_identity, full_name="BIST:OTHER")):
+        with pytest.raises(DeepExportError):
+            deep_capture._assert_chart_task(replace(snapshot, symbol_identity=identity), expected)
+
+
 def test_task_bound_capture_refreshes_then_claims_one_export(tmp_path, monkeypatch):
     driver, report, expected, guard, guarded = setup_capture(tmp_path, monkeypatch)
     capture = deep_capture.capture_task_deep_export(
@@ -81,6 +93,17 @@ def test_task_bound_capture_refreshes_then_claims_one_export(tmp_path, monkeypat
     assert len(capture.trades) == 1
     assert (driver.refreshed, driver.downloaded) == (1, 1)
     assert guarded == ["worker-2"] * 8
+
+
+def test_capture_rejects_series_identity_change_during_download(tmp_path, monkeypatch):
+    driver, report, expected, guard, guarded = setup_capture(tmp_path, monkeypatch)
+    original = driver.snapshot
+    identities = iter([{"feed": "before"}, {"feed": "after"}])
+    driver.snapshot = lambda target, study: replace(original(target, study), symbol_identity=next(identities))
+    with pytest.raises(DeepExportError, match="sembol kimliği"):
+        deep_capture.capture_task_deep_export(driver, target_id="worker-2", study_id="study-2",
+            expected=expected, pine_source='strategy("Scan")\nlength=input.int(3,"Length")',
+            changed_input_ids={"in_0"}, download_directory=tmp_path, guard=guard)
 
 
 def test_task_bound_capture_waits_for_transient_calculation_but_not_wrong_input(tmp_path, monkeypatch):

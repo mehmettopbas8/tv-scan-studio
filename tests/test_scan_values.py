@@ -16,3 +16,11 @@ def test_invalid_ranges_are_rejected():
         parse_scan_values({"start": 1, "stop": 2, "step": 0})
     with pytest.raises(ValueError, match="yönü"):
         parse_scan_values({"start": 1, "stop": 2, "step": -1})
+
+
+@pytest.mark.parametrize("key", ["start", "stop", "step"])
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_nonfinite_ranges_raise_readable_error(key, value):
+    spec = {"start": 0, "stop": 1, "step": 0.1, key: value}
+    with pytest.raises(ValueError, match="sonlu"):
+        parse_scan_values(spec)

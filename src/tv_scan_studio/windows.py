@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ctypes
 import os
 import re
 import subprocess
@@ -12,6 +13,54 @@ import urllib.parse
 import urllib.error
 from pathlib import Path
 from typing import Callable
+from .processes import HelperStartupError, run_hidden, popen_external
+
+
+def _native_cdp_owner() -> bool:
+    """Resolve TCP listener owners with Win32; no PowerShell process is needed."""
+    from ctypes import wintypes
+    iphelper = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_table = iphelper.GetExtendedTcpTable
+    get_table.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+                         wintypes.ULONG, ctypes.c_int, wintypes.ULONG]
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    owners = set()
+    for family, row_size, port_offset, pid_offset in ((2, 24, 8, 20), (23, 56, 20, 52)):
+        size = wintypes.DWORD(0)
+        result = get_table(None, ctypes.byref(size), False, family, 3, 0)
+        if result not in (0, 122):
+            return False
+        data = ctypes.create_string_buffer(size.value)
+        if get_table(data, ctypes.byref(size), False, family, 3, 0) != 0:
+            return False
+        count = int.from_bytes(data.raw[:4], "little")
+        if 4 + count * row_size > size.value:
+            return False
+        for index in range(count):
+            row = data.raw[4 + index * row_size:4 + (index + 1) * row_size]
+            if int.from_bytes(row[port_offset:port_offset + 2], "big") == 9222:
+                owners.add(int.from_bytes(row[pid_offset:pid_offset + 4], "little"))
+    if not owners or 0 in owners:
+        return False
+    for pid in owners:
+        process = kernel.OpenProcess(0x1000, False, pid)
+        if not process:
+            return False
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+                return False
+            if Path(buffer.value).name.casefold() != "tradingview.exe":
+                return False
+        finally:
+            kernel.CloseHandle(process)
+    return True
 
 
 class TabCreationError(RuntimeError):
@@ -37,7 +86,7 @@ def _is_tradingview_chart(url: str) -> bool:
 
 def find_tradingview_executables(
     *, env: dict[str, str] | None = None,
-    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess] = run_hidden,
 ) -> list[Path]:
     env = env or os.environ
     candidates = [
@@ -55,6 +104,8 @@ def find_tradingview_executables(
             location = Path(line.strip())
             if line.strip():
                 candidates.extend((location / "TradingView.exe", location / "app" / "TradingView.exe"))
+    except HelperStartupError:
+        raise
     except (OSError, subprocess.SubprocessError):
         pass
     unique: list[Path] = []
@@ -64,11 +115,16 @@ def find_tradingview_executables(
 
 
 def cdp_owned_by_tradingview(
-    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess] = run_hidden,
 ) -> bool:
     """Fail closed unless every process listening on 9222 is TradingView Desktop."""
     if os.name != "nt":
         return False
+    if run is run_hidden:
+        try:
+            return _native_cdp_owner()
+        except (OSError, ValueError):
+            return False
     try:
         result = run(
             ["powershell", "-NoProfile", "-Command",
@@ -150,17 +206,16 @@ def worker_layout_candidates(targets: list[dict[str, str]],
     chart_ids = [urllib.parse.urlsplit(item["url"]).path.split("/")[2]
                  for item in targets if _is_tradingview_chart(item.get("url", ""))]
     candidates: dict[str, str] = {}
-    seen_names: set[str] = set()
+    all_names = list(layout_names.values())
     for item in targets:
         target_id, url = item.get("id", ""), item.get("url", "")
         name = layout_names.get(target_id, "")
         if not target_id or not _is_tradingview_chart(url) or not re.fullmatch(r"TV Scan Worker [1-9]\d*", name):
             continue
         chart_id = urllib.parse.urlsplit(url).path.split("/")[2]
-        if chart_ids.count(chart_id) != 1 or name in seen_names:
-            raise ValueError("Worker layout adı ve chart kimliği her açık sekmede benzersiz olmalı.")
+        if chart_ids.count(chart_id) != 1 or all_names.count(name) != 1:
+            continue  # A conflicting layout must not disable independent workers.
         candidates[target_id] = chart_id
-        seen_names.add(name)
     return candidates
 
 
@@ -232,7 +287,7 @@ def open_chart_tabs(count: int, *, port: int = 9222, timeout: float = 5,
 
 
 def tradingview_running(
-    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess] = run_hidden,
 ) -> bool:
     try:
         result = run(["tasklist", "/FI", "IMAGENAME eq TradingView.exe", "/FO", "CSV"],
@@ -252,7 +307,7 @@ def launch_with_cdp(executable: str | Path, port: int = 9222) -> subprocess.Pope
     if cdp_healthy(port):
         raise RuntimeError("TradingView CDP bağlantısı zaten hazır.")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.Popen(
+    return popen_external(
         [str(path), f"--remote-debugging-port={port}", "--remote-allow-origins=*"],
         creationflags=flags,
     )

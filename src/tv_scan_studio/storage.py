@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS results (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS results_project_idx ON results(project_id, classification);
+CREATE TABLE IF NOT EXISTS saved_presets (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL UNIQUE,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS verification_evidence (
     task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     evidence TEXT NOT NULL,
@@ -161,6 +169,25 @@ class Store:
                 (name, pine_source, pine_hash, priority, now, now),
             )
             return int(cursor.lastrowid)
+
+    def save_unique_project(self, name: str, pine_source: str, *, copy: bool = False) -> tuple[int, bool]:
+        """Reuse identical source without deleting or merging historical projects."""
+        digest = hashlib.sha256(pine_source.encode("utf-8")).hexdigest()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if not copy:
+                existing = connection.execute(
+                    "SELECT id FROM projects WHERE pine_hash=? AND pine_source=? ORDER BY id LIMIT 1",
+                    (digest, pine_source),
+                ).fetchone()
+                if existing:
+                    return int(existing["id"]), False
+            now = time.time()
+            cursor = connection.execute(
+                "INSERT INTO projects(name,pine_source,pine_hash,priority,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (name, pine_source, digest, 0, now, now),
+            )
+            return int(cursor.lastrowid), True
 
     def enqueue(self, project_id: int, task_key: str, payload: dict[str, Any]) -> bool:
         with self.connect() as connection:
@@ -445,6 +472,30 @@ class Store:
             for row in rows
         ]
 
+    def save_result_preset(self, project_id: int, task_id: int, name: str) -> int:
+        """Snapshot an actual local result, without changing tasks or evidence."""
+        name = name.strip()
+        if not name:
+            raise ValueError("Preset adı boş olamaz.")
+        project = self.project(project_id)
+        result = next((row for row in self.results(project_id) if row["task_id"] == task_id), None)
+        if project is None or result is None:
+            raise ValueError("Bu projeye ait kayıtlı bir test sonucu bulunamadı.")
+        snapshot = {"project_name": project["name"], "pine_hash": project["pine_hash"],
+                    "pine_source": project["pine_source"],
+                    "source_snapshot_scope": "current_project_at_save", "result": result}
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO saved_presets(task_id,project_id,name,snapshot,created_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(task_id) DO NOTHING",
+                (task_id, project_id, name, json.dumps(snapshot, ensure_ascii=False), time.time()))
+            return int(connection.execute("SELECT id FROM saved_presets WHERE task_id=?", (task_id,)).fetchone()[0])
+
+    def saved_presets(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM saved_presets ORDER BY created_at DESC,id DESC").fetchall()
+        return [{**dict(row), "snapshot": json.loads(row["snapshot"])} for row in rows]
+
     def task_summaries(self, status: str | None, *, project_id: int | None = None,
                        limit: int = 500) -> tuple[int, list[dict[str, Any]]]:
         """Bounded task browser for dashboard counters, without loading huge queues."""
@@ -462,12 +513,12 @@ class Store:
         with self.connect() as connection:
             total = connection.execute("SELECT COUNT(*) FROM tasks t" + condition, parameters).fetchone()[0]
             rows = connection.execute(
-                "SELECT t.id,t.task_key,t.payload,p.name project_name FROM tasks t "
+                "SELECT t.id,t.task_key,t.payload,t.status,p.name project_name FROM tasks t "
                 "JOIN projects p ON p.id=t.project_id" + condition + " ORDER BY t.id DESC LIMIT ?",
                 (*parameters, max(1, min(limit, 5000))),
             ).fetchall()
         return total, [{"task_id": row["id"], "task_key": row["task_key"],
-                        "project": row["project_name"], "payload": json.loads(row["payload"])}
+                        "project": row["project_name"], "status": row["status"], "payload": json.loads(row["payload"])}
                        for row in rows]
 
     def iter_task_records(self, project_id: int, *, connection: sqlite3.Connection | None = None):
