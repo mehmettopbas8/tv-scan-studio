@@ -7,7 +7,7 @@ import hashlib
 import sqlite3
 import time
 import tempfile
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Callable
@@ -235,8 +235,12 @@ class Store:
                     if not batch:
                         return
                     checkpoint()
-                    cursor = staging.executemany("INSERT OR IGNORE INTO queue VALUES(?,?)", batch)
-                    staged += cursor.rowcount
+                    # Cancellation retains this frame in its traceback. SQLite
+                    # on Python 3.11 can retain the handle via an unclosed cursor
+                    # even after Connection.close(), preventing Windows cleanup.
+                    with closing(staging.cursor()) as cursor:
+                        cursor.executemany("INSERT OR IGNORE INTO queue VALUES(?,?)", batch)
+                        staged += cursor.rowcount
                     processed += len(batch)
                     batch.clear()
                     staging.commit()
@@ -289,10 +293,11 @@ class Store:
                         raise ValueError("Bu stratejide başka bir taramadan bekleyen görevler var. Sonuçlar > Görevler bölümünde onları inceleyin; bu hazırlık eski görevleri otomatik çalıştırmaz.")
                     if settings is not None:
                         self.save_settings(project_id, settings, connection=connection)
-                    cursor = connection.execute(
-                        "INSERT OR IGNORE INTO tasks(project_id,task_key,payload,updated_at) "
-                        "SELECT ?,? || task_key,payload,? FROM admission.queue ORDER BY rowid", (project_id, prefix, now))
-                    inserted = cursor.rowcount
+                    with closing(connection.cursor()) as cursor:
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO tasks(project_id,task_key,payload,updated_at) "
+                            "SELECT ?,? || task_key,payload,? FROM admission.queue ORDER BY rowid", (project_id, prefix, now))
+                        inserted = cursor.rowcount
                     connection.execute("INSERT OR IGNORE INTO run_tasks(task_id,run_id,test_key) "
                         "SELECT t.id,?,q.task_key FROM admission.queue q JOIN tasks t ON t.project_id=? AND t.task_key=? || q.task_key",
                         (run_id, project_id, prefix))

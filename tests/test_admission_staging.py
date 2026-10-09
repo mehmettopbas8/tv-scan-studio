@@ -141,3 +141,41 @@ def test_owned_staging_files_removed_on_completion_or_cancel(tmp_path, monkeypat
         assert enqueue_plan(store, project, plan) == 600
     assert paths and all(not path.exists() for path in paths)
     assert store.path.exists()
+
+
+@pytest.mark.parametrize('phase', ['staging', 'final_copy'])
+def test_admission_cursors_closed_before_cancel_traceback_retained(tmp_path, monkeypatch, phase):
+    """Do not depend on CPython/SQLite's deferred cursor finalization behavior."""
+    import sqlite3
+    import tv_scan_studio.storage as storage
+    store, project, plan = setup_store(tmp_path)
+    cursors = []
+    class TrackingCursor(sqlite3.Cursor):
+        closed = False
+        def close(self):
+            self.closed = True
+            return super().close()
+    class TrackingConnection(storage._ClosingConnection):
+        def cursor(self, *args, **kwargs):
+            cursor = super().cursor(factory=TrackingCursor)
+            cursors.append(cursor)
+            return cursor
+    original = sqlite3.connect
+    def connect(*args, **kwargs):
+        kwargs['factory'] = TrackingConnection
+        connection = original(*args, **kwargs)
+        if phase == 'final_copy':
+            def trace(sql):
+                if sql.startswith('INSERT OR IGNORE INTO tasks') and 'admission.queue' in sql:
+                    cancelled.set()
+            connection.set_trace_callback(trace)
+        return connection
+    monkeypatch.setattr(storage.sqlite3, 'connect', connect)
+    cancelled = threading.Event()
+    with pytest.raises(PlanCancelled) as retained:
+        enqueue_plan(store, project, plan, cancel_requested=cancelled.is_set,
+                     progress=(lambda *_args: cancelled.set()) if phase == 'staging' else None)
+    assert retained.value.__traceback__ is not None
+    assert cursors and all(cursor.closed for cursor in cursors)
+    assert store.tasks(project) == []
+    assert store.settings(project) == {'old': 'keep'}

@@ -119,15 +119,17 @@ class WorkerSupervisor:
         return restarted
 
     def _loop(self, assignment: WorkerAssignment, stop_when_idle: bool) -> None:
-        worker = ScanWorker(
-            assignment.worker_id, assignment.target_id, self.store, self.driver,
-            list(assignment.project_ids), assignment.study_id, self.target_guard,
-            self.download_directory,
-            cancel_requested=self._stop.is_set,
-            run_ids=list(assignment.run_ids) if assignment.run_ids is not None else None,
-        )
         state = self.states[assignment.worker_id]
         try:
+            # Initialization is part of the worker lifecycle too: an exception
+            # must be visible as failed, not leave a dead thread marked starting.
+            worker = ScanWorker(
+                assignment.worker_id, assignment.target_id, self.store, self.driver,
+                list(assignment.project_ids), assignment.study_id, self.target_guard,
+                self.download_directory,
+                cancel_requested=self._stop.is_set,
+                run_ids=list(assignment.run_ids) if assignment.run_ids is not None else None,
+            )
             while not self._stop.is_set():
                 state.status = "running"; state.last_seen = time.time()
                 worked = worker.run_one()

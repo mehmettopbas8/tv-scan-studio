@@ -1,4 +1,7 @@
 import threading
+import sys
+import traceback
+from dataclasses import asdict
 
 import pytest
 
@@ -61,22 +64,44 @@ def test_workers_only_process_their_assigned_projects(tmp_path):
     store = Store(tmp_path / "assigned-projects.db")
     first = store.create_project("First", 'strategy("First")')
     second = store.create_project("Second", 'strategy("Second")')
+    unassigned = store.create_project("Unassigned", 'strategy("Unassigned")')
     payload = {"study_id": "sid", "symbol": "OANDA:EURUSD", "timeframe": "15",
-               "inputs": {"in_0": 20}, "poll_interval": 0, "timeout": 1,
+               "inputs": {"in_0": 20}, "poll_interval": 0, "timeout": 1, "stable_reads": 1,
                "criteria": {"min_trades": 60}}
-    for index in range(4):
+    # Assignment isolation is not a disk-throughput benchmark. Two tasks still
+    # prove repeated claims without tying correctness to eight fsync-heavy jobs.
+    for index in range(2):
         store.enqueue(first, f"first-{index}", payload)
         store.enqueue(second, f"second-{index}", payload)
+        store.enqueue(unassigned, f"unassigned-{index}", payload)
     supervisor = WorkerSupervisor(store, ParallelFakeDriver(), heartbeat_seconds=0.01)
     supervisor.start([
         WorkerAssignment(1, "target-1", (first,), "sid-one"),
         WorkerAssignment(2, "target-2", (second,), "sid-two"),
     ], stop_when_idle=True)
-    assert supervisor.wait(5)
-    assert store.counts(first) == {"done": 4}
-    assert store.counts(second) == {"done": 4}
-    assert supervisor.states[1].completed == 4
-    assert supervisor.states[2].completed == 4
+    try:
+        finished = supervisor.wait(5)
+        frames = sys._current_frames()
+        diagnostics = {
+            "states": {key: asdict(value) for key, value in supervisor.states.items()},
+            "threads": [{"name": thread.name, "alive": thread.is_alive(),
+                         "stack": ''.join(traceback.format_stack(frames[thread.ident]))
+                         if thread.ident in frames else "terminated"}
+                        for thread in supervisor._threads],
+        }
+        assert finished, diagnostics
+    finally:
+        if supervisor.running:
+            supervisor.request_stop()
+            assert supervisor.wait(5), "Worker did not terminate after cancellation"
+    assert store.counts(first) == {"done": 2}
+    assert store.counts(second) == {"done": 2}
+    assert store.counts(unassigned) == {"pending": 2}
+    assert all(row['attempts'] == 0 for row in store.tasks(unassigned))
+    assert supervisor.states[1].completed == 2
+    assert supervisor.states[2].completed == 2
+    assert all(state.status == 'idle' and state.error is None and state.attempts == 2
+               for state in supervisor.states.values())
     assert {row["evidence"]["target_id"] for row in store.results(first)} == {"target-1"}
     assert {row["evidence"]["target_id"] for row in store.results(second)} == {"target-2"}
 
@@ -200,3 +225,23 @@ def test_supervisor_restarts_terminal_failed_worker_at_most_three_times(tmp_path
     state.status = "failed"
     assert supervisor.restart_failed() == []
     assert len(started) == 3
+
+
+def test_worker_initialization_failure_is_terminal_and_preserves_queue(tmp_path, monkeypatch):
+    store = Store(tmp_path / 'init-failure.db')
+    project = store.create_project('Init', 'strategy("Init")')
+    store.enqueue(project, 'pending', {})
+    def broken_worker(*args, **kwargs):
+        raise ValueError('synthetic initialization failure')
+    monkeypatch.setattr('tv_scan_studio.supervisor.ScanWorker', broken_worker)
+    supervisor = WorkerSupervisor(store, ParallelFakeDriver())
+    supervisor.start([WorkerAssignment(1, 'target-1', (project,))], stop_when_idle=True)
+    assert supervisor.wait(5)
+    assert not supervisor.running
+    state = supervisor.states[1]
+    assert state.status == 'failed'
+    assert state.error == 'synthetic initialization failure'
+    assert state.completed == state.attempts == 0
+    assert store.counts(project) == {'pending': 1}
+    assert store.tasks(project)[0]['attempts'] == 0
+    assert store.events()[0]['message'] == state.error
