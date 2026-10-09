@@ -6,7 +6,20 @@ Projeler, görev kuyruğu, sonuçlar ve doğrulama kayıtları SQLite'ta tutulur
 
 > Sürüm durumu: `0.2.0-rc.2` ön sürüm / kabul adayıdır, kararlı sürüm değildir. Kaynak ve paket testleri bütün canlı kullanıcı kabulünü kanıtlamaz. Üç ekranlı akış, popup rehber, çoklu grafik ve Excel düzeltmeleri bu sürümdedir; planlanan yeni özellikler henüz değildir.
 
-### Bilinen sınırlar ve planlanan işler
+### Geliştirme dalı: henüz yayımlanmamış toplu sürüm
+
+`codex/batch-ui-research` dalındaki kaynak, yayımlanmış `v0.2.0-rc.2` paketinden ileridedir. Aşağıdaki geliştirmeler bu dalda bulunur; mevcut rc2 indirmesinde varmış gibi değerlendirmeyin:
+
+- Merkezi tooltip/F1 yardımı ve özellik bazlı ilk kullanım turları.
+- Atomik plan kabulü, güvenli durdurma, ayrı tarama koşuları, değişmez sonuç/deneme geçmişi ve sonuçları tekrar test etmeden değerlendirme.
+- İsteğe bağlı tohumlu örnekleme, ayarlar arası kısıtlar, kullanıcı seçimli kaba→ince tarama, 2–5 sonuç karşılaştırması ve adayları kilitleyen ayrı dönem araştırması.
+- Checksum'lı araştırma arşivi içe aktarımı, seçili arşiv/rapor/kanıt dosyalarını taşıyan yedekleme ve yeni hedefe geri yükleme.
+- Önizlemeli, yalnız yerel destek ZIP'i; özel kod, hesap ve ekran görüntüleri otomatik eklenmez, otomatik yükleme yoktur.
+- Normal raporda kapalı işlemlerle açık pozisyon giriş komisyonunun ayrı uzlaştırılması; uzun Excel metinlerinin kayıpsız teknik ayrıntı sayfasına bölünmesi.
+
+Bu dalın CI çıktısı bir geliştirme paketidir. Görünür son-EXE taraması, kesinti/kurtarma, Windows ölçekleri, native Excel ve eski/yeni 1/2/8 paralel grafik performans kabulü tamamlanmadan kararlı veya teslim edilmiş sürüm sayılmaz. Görev/sonuç doğrulaması kârlılık garantisi değildir. Aynı sürüm metni tek başına aynı EXE demek değildir; commit ve SHA-256 kimliğini ayrıca kontrol edin. Eski verileri yeni kaynakla açmadan önce yedek alın.
+
+### Yayımlanmış rc2'nin bilinen sınırları ve planlanan işleri
 
 - Gerçek kesinti/kurtarma, boş kullanıcıdan uçtan uca tarama, özel tarih ve çoklu grafik performansının yeni pakette görünür kabulü ayrı kapılardır.
 - Durdur eylemi mevcut işi güvenli noktada bitirmeyi bekler; mesaj tek başına bütün workerların bittiğini kanıtlamaz. Grafiği değiştirmeden veya yeniden başlatmadan çalışan işlerin bitmesini kontrol edin.
