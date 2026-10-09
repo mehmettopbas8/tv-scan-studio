@@ -17,17 +17,38 @@ def test_transient_windows_error_retries_atomic_rename(tmp_path, monkeypatch, co
     owned, target = tmp_path / "ready", tmp_path / "published"
     owned.mkdir()
     (owned / "source").write_text("unchanged")
-    original = Path.rename
-    attempts, sleeps = [], []
+    attempts, sleeps, successes = [], [], []
     def rename(self, destination):
         attempts.append(destination)
         if len(attempts) < 3:
             raise windows_error(code)
-        return original(self, destination)
+        # Isolate retry scheduling from an additional real Windows lock.
+        successes.append((self, destination))
+        return destination
     monkeypatch.setattr(Path, "rename", rename)
     monkeypatch.setattr(archives.time, "sleep", sleeps.append)
     archives._publish_archive(owned, target)
     assert len(attempts) == 3 and sleeps == [0.05, 0.1]
+    assert successes == [(owned, target)]
+    assert (owned / "source").read_text() == "unchanged"
+    assert not target.exists()
+
+
+def test_real_publication_after_transient_errors_uses_product_waits(tmp_path, monkeypatch):
+    owned, target = tmp_path / "ready", tmp_path / "published"
+    owned.mkdir()
+    (owned / "source").write_text("unchanged")
+    original = Path.rename
+    attempts = []
+    def rename(self, destination):
+        attempts.append(destination)
+        if len(attempts) < 3:
+            raise windows_error()
+        return original(self, destination)
+    monkeypatch.setattr(Path, "rename", rename)
+    # Do not mock sleep: the real filesystem uses the bounded product recovery.
+    archives._publish_archive(owned, target)
+    assert 3 <= len(attempts) <= 4
     assert (target / "source").read_text() == "unchanged"
     assert not owned.exists()
 

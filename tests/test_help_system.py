@@ -177,6 +177,34 @@ def test_feature_first_use_waits_for_interaction_and_help_can_reopen():
         app.processEvents()
 
 
+def test_conditional_first_use_checks_current_state_after_focus_is_queued():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = QtWidgets.QWidget()
+    target = QtWidgets.QLineEdit(window)
+    state = {'sampling': False}
+    registry = HelpRegistry(window)
+    registry.register(HelpSpec('sample.budget', 1, 'Bütçe', 'Örnekleme bütçesi.', 'Yalnız örnekleme.', target))
+    registry.register_tour(TourSpec('sampling', 1, ((target, 'Bütçe', 'Örnekleme bütçesini seç.', None),)))
+    registry.bind_first_use(target, 'sampling', when=lambda: state['sampling'])
+    try:
+        window.show()
+        app.sendEvent(target, QtCore.QEvent(QtCore.QEvent.FocusIn))
+        app.processEvents()
+        assert registry.active_tour is None
+        state['sampling'] = True
+        app.sendEvent(target, QtCore.QEvent(QtCore.QEvent.FocusIn))
+        state['sampling'] = False  # delayed focus cannot open a now-inactive feature
+        app.processEvents()
+        assert registry.active_tour is None
+        state['sampling'] = True
+        app.sendEvent(target, QtCore.QEvent(QtCore.QEvent.FocusIn))
+        app.processEvents()
+        assert registry.active_tour is not None
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_column_help_follows_logical_column_after_reordering():
     from PySide6 import QtGui
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

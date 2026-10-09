@@ -759,7 +759,11 @@ class StudioWindow:
             (self.sample_budget, "Test bütçesini belirle", "Örnekleme için pozitif tam sayı gir. Tam taramada bu alan kullanılmaz; zorunlu 500 sınırı yoktur.", None),
             (self.sample_seed, "Seçimi yeniden üret", "Aynı plan ve tohum aynı testleri seçer. Denenmeyen ayarlar sonuç gibi gösterilmez. Rehber tarama başlatmaz.", None),
         )))
-        self.help_registry.bind_first_use(self.scan_method, "sampling")
+        sampling_active = lambda: self.scan_method.currentData() == "sample"
+        for target in (self.scan_method, self.sample_budget, self.sample_seed):
+            self.help_registry.bind_first_use(target, "sampling", when=sampling_active)
+        self.scan_method.currentIndexChanged.connect(lambda *_:
+            self.help_registry.start_tour("sampling", automatic=True) if sampling_active() else None)
         self.sampling_guide.clicked.connect(lambda: self.help_registry.start_tour("sampling"))
         self.help_registry.register_tour(TourSpec("coarse", 1, (
             (self.scan_method, "Kaba aşamayı seç", "Değer aralıklarını kendin belirle. Kaba aşama bütün seçili kombinasyonları dener; otomatik kazanan veya 500 sınırı yoktur.", None),

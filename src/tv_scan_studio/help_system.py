@@ -48,6 +48,7 @@ class HelpRegistry(QtCore.QObject):
         self.coordinator = coordinator or self
         self._active_tour = None
         self._first_use = {}
+        self._first_use_conditions = {}
         self.read_settings = read_settings or (lambda: {})
         self.save_settings = save_settings or (lambda _values: None)
         window.installEventFilter(self)
@@ -83,6 +84,7 @@ class HelpRegistry(QtCore.QObject):
                 del self.specs[feature_id]
                 self._targets.pop(spec.target, None)
                 self._first_use.pop(spec.target, None)
+                self._first_use_conditions.pop(spec.target, None)
         self._column_specs = {key: value for key, value in self._column_specs.items() if key[0] not in targets}
         self.tours = {key: value for key, value in self.tours.items()
                       if not any(step[0] in targets for step in value.steps)}
@@ -92,14 +94,17 @@ class HelpRegistry(QtCore.QObject):
             raise ValueError("Tour requires a stable ID, version and steps")
         self.tours[spec.feature_id] = spec
 
-    def bind_first_use(self, widget, feature_id):
+    def bind_first_use(self, widget, feature_id, *, when=None):
         if feature_id not in self.tours:
             raise ValueError("Register the tour before binding first use")
         self._first_use[widget] = feature_id
+        self._first_use_conditions[widget] = when
         widget.installEventFilter(self)
 
     def _first_use_if_visible(self, widget, feature_id):
-        if self._first_use.get(widget) == feature_id and widget.isVisible():
+        condition = self._first_use_conditions.get(widget)
+        if (self._first_use.get(widget) == feature_id and widget.isVisible()
+                and (condition is None or condition())):
             self.start_tour(feature_id, automatic=True)
 
     def start_tour(self, feature_id, *, automatic=False, finished=None):
