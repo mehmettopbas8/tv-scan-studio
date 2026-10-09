@@ -193,7 +193,10 @@ def test_saved_source_unavailable_is_not_a_match(response):
 def test_private_source_retry_does_not_save_again_after_ambiguous_failure():
     driver = GncZihinDriver()
     driver.strategies = lambda target: []
-    driver._motor = SimpleNamespace(_eval=lambda *args, **kwargs: pytest.fail("Must not save twice"))
+    def read_only(target, expression, **kwargs):
+        assert "listSavedScripts" in expression
+        return []
+    driver._motor = SimpleNamespace(_eval=read_only)
     journal = {"source_hash": pine_source_hash("source"), "save_requested": True}
     with pytest.raises(RuntimeError, match="kopya"):
         driver.load_private_source("owned", "source", journal=journal,
@@ -217,6 +220,8 @@ def test_private_source_persists_save_intent_even_when_network_fails():
     driver = GncZihinDriver()
     driver.strategies = lambda target: []
     def fail(*args, **kwargs):
+        if "listSavedScripts" in args[1]:
+            return []
         assert journal["save_requested"]
         assert saved[-1]["save_requested"]
         raise RuntimeError("network")
@@ -239,6 +244,8 @@ def test_private_source_happy_path_persists_identity_before_attach():
     def evaluate(target, expression, **kwargs):
         assert target == "owned" and kwargs == {"await_promise": True}
         calls.append(expression)
+        if "listSavedScripts" in expression:
+            return []
         if "saveNewScript" in expression:
             assert saved[-1]["save_requested"] is True
             return {"success": True, "metaInfo": {"scriptIdPart": "USER;private", "pine": {"version": "1.0"}}}
@@ -252,7 +259,7 @@ def test_private_source_happy_path_persists_identity_before_attach():
     driver._motor = SimpleNamespace(_eval=evaluate)
     assert driver.load_private_source("owned", source, journal=journal,
         persist=saved.append, guard=guards.append) == study
-    assert len(calls) == 3 and len(guards) == 5
+    assert len(calls) == 4 and len(guards) == 5
     assert saved[-1]["study_id"] == "applied"
 
 
@@ -295,6 +302,8 @@ def test_cancel_after_private_save_retains_identity_for_safe_retry():
     driver.strategies = lambda target: []
     journal, saved = {}, []
     def evaluate(target, expression, **kwargs):
+        if "listSavedScripts" in expression:
+            return []
         assert "saveNewScript" in expression
         return {"success": True, "metaInfo": {"scriptIdPart": "USER;private", "pine": {"version": "1.0"}}}
     driver._motor = SimpleNamespace(_eval=evaluate)

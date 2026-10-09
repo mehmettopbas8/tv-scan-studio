@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +50,35 @@ class PineInput:
     tooltip: str | None = None
     manual_definition_required: bool = False
     metadata_warnings: tuple[str, ...] = ()
+
+def validate_input_value(spec: PineInput, value: Any) -> None:
+    """Validate typed values against the source declaration, without coercion."""
+    label = spec.title
+    if spec.kind in {"int", "float"}:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{label}: sonlu sayısal değer gerekli.")
+        if spec.kind == "int" and not isinstance(value, int):
+            raise ValueError(f"{label}: tam sayı gerekli.")
+        if spec.minimum is not None and value < spec.minimum:
+            raise ValueError(f"{label}: en küçük değer {spec.minimum}.")
+        if spec.maximum is not None and value > spec.maximum:
+            raise ValueError(f"{label}: en büyük değer {spec.maximum}.")
+        if spec.step is not None:
+            if not math.isfinite(spec.step) or spec.step <= 0:
+                raise ValueError(f"{label}: kodda geçersiz adım tanımı var.")
+            origin = spec.minimum if spec.minimum is not None else spec.default
+            if not isinstance(origin, (int, float)) or isinstance(origin, bool):
+                raise ValueError(f"{label}: adım başlangıcı doğrulanamıyor.")
+            units = (value - origin) / spec.step
+            if not math.isfinite(units) or not math.isclose(units, round(units), abs_tol=1e-8, rel_tol=0):
+                raise ValueError(f"{label}: {spec.step} adımına uygun değer gerekli.")
+    elif spec.kind == "bool" and not isinstance(value, bool):
+        raise ValueError(f"{label}: açık/kapalı değeri gerekli.")
+    elif spec.kind in {"string", "session", "timeframe"} and not isinstance(value, str):
+        raise ValueError(f"{label}: metin değeri gerekli.")
+    if spec.options is not None and value not in spec.options:
+        raise ValueError(f"{label}: kodda tanımlı seçenekleri kullanın.")
+
 
 def _literal(value: str) -> Any:
     value = value.strip()

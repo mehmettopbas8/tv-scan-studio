@@ -873,6 +873,13 @@ def test_ui_refuses_date_plan_until_tradingview_can_apply_dates(tmp_path, monkey
     if not ready:
         assert "özel tarih henüz" in studio.plan_status.text()
     studio.enqueue_current_plan()
+    if ready:
+        import time
+        deadline = time.monotonic() + 5
+        while studio._admission_job is not None and time.monotonic() < deadline:
+            application.processEvents()
+            time.sleep(.001)
+        assert studio._admission_job is None
     assert store.counts(project) == ({'pending':1} if ready else {})
     if not ready:
         assert "tarihli görevler kuyruklanamaz" in studio.plan_status.text()
@@ -961,22 +968,28 @@ def test_new_project_does_not_inherit_previous_projects_costs_or_criteria(tmp_pa
     studio.window.close()
 
 
-def test_scan_input_shows_controlled_no_effect_hint_without_excluding(tmp_path):
+@pytest.mark.parametrize("with_evidence", [True, False])
+def test_scan_input_shows_controlled_no_effect_hint_without_excluding(tmp_path, with_evidence):
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     store = Store(tmp_path / "no-effect.db")
     project = store.create_project("No effect", 'strategy("No effect")\nlength=input.int(3,"Length")\nplot(length)')
     metrics = {"trades": 80, "profit_factor": 1.7, "max_drawdown_pct": 4.0,
                "net_profit": 900}
     for value in (2, 3, 4):
-        store.enqueue(project, f"length-{value}", {"symbol": "DE30", "timeframe": "15",
-                                                  "inputs": {"in_0": value}})
+        payload = {"symbol": "OANDA:DE30EUR", "timeframe": "15", "inputs": {"in_0": value},
+                   "date_range": {"from": "2026-01-01", "to": "2026-03-31"},
+                   "costs": {"assumptions": {"initial_capital": 100000}}}
+        store.enqueue(project, f"length-{value}", payload)
         task = store.claim_next(1)
-        store.complete(task.id, 1, metrics, "hassas", verified=True)
+        evidence = {"symbol": payload["symbol"], "timeframe": "15", "inputs": payload["inputs"],
+                    "period": {"from": "2026-01-01", "to": "2026-03-31"}, "report_currency": "EUR",
+                    "cost_verification_scope": "strategy_properties_ui_spread_unverified"} if with_evidence else {}
+        store.complete(task.id, 1, metrics, "hassas", verified=True, evidence=evidence)
     studio = StudioWindow(store)
     studio.refresh_project_selectors()
     note = studio.plan_inputs.item(0, 6).text()
-    assert "etkisiz olabilir" in note
-    assert "Otomatik dışlanmadı" in note
+    assert ("etkisiz olabilir" in note) is with_evidence
+    assert ("Otomatik dışlanmadı" in note) is with_evidence
     assert studio.plan_inputs.cellWidget(0, 3).currentText() == "Sabit bırak"
     assert studio.auto_excluded_notice.isHidden()
     studio.worker_timer.stop()
@@ -1299,7 +1312,8 @@ def test_comparison_marks_unverified_result_as_unverified(tmp_path, monkeypatch)
         labels = [label.text() for label in dialog.findChildren(QtWidgets.QLabel)]
         table = dialog.findChild(QtWidgets.QTableWidget)
         observed["labels"] = labels
-        observed["proof"] = [table.item(4, column).text() for column in range(2)]
+        proof_row = next(index for index in range(table.rowCount()) if table.verticalHeaderItem(index).text() == "Kanıt")
+        observed["proof"] = [table.item(proof_row, column).text() for column in range(2)]
         return QtWidgets.QDialog.Rejected
 
     monkeypatch.setattr(QtWidgets.QDialog, "exec", inspect_dialog)
@@ -1341,7 +1355,7 @@ def test_result_filter_preset_round_trip(tmp_path, monkeypatch):
     studio.refresh_project_selectors()
     studio.filter_pf.setValue(1.55)
     studio.filter_symbol.setText("DE30")
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *_args: ("DE30 güçlü", True))
+    monkeypatch.setattr(studio, "_ask_text_with_help", lambda *_args: ("DE30 güçlü", True))
     studio.save_result_filter()
     studio.filter_pf.setValue(0)
     studio.filter_symbol.clear()
@@ -1372,7 +1386,7 @@ def test_cost_scenario_filter_uses_project_values_and_persists(tmp_path, monkeyp
     studio.filter_cost_scenario.setCurrentIndex(studio.filter_cost_scenario.findData("Ağır stres"))
     assert studio.results_table.rowCount() == 1
     assert "Maliyet: Ağır stres" in studio._active_result_filter_labels()
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *_args: ("Ağır maliyet", True))
+    monkeypatch.setattr(studio, "_ask_text_with_help", lambda *_args: ("Ağır maliyet", True))
     studio.save_result_filter()
     studio.clear_result_filters()
     assert studio.results_table.rowCount() == 2

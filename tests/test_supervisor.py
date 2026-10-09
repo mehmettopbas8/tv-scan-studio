@@ -21,6 +21,24 @@ class ParallelFakeDriver:
         )
 
 
+def test_worker_run_scope_leaves_other_run_pending(tmp_path):
+    from tv_scan_studio.planner import ScanPlan, enqueue_plan
+    store = Store(tmp_path / "run-scope.db")
+    project = store.create_project("Parallel", 'strategy("Parallel")\na=input.int(20)')
+    plan = ScanPlan("sid", ("OANDA:EURUSD",), ("15",), {"in_0": [20]},
+                    poll_interval=.001, timeout=1, stable_reads=1)
+    enqueue_plan(store, project, plan, new_run=True)
+    old_run = store.scan_runs(project)[0]["id"]
+    enqueue_plan(store, project, plan, new_run=True)
+    selected_run = store.scan_runs(project)[0]["id"]
+    supervisor = WorkerSupervisor(store, ParallelFakeDriver(), heartbeat_seconds=.01)
+    supervisor.start([WorkerAssignment(1, "target-1", (project,), "sid", (selected_run,))], stop_when_idle=True)
+    assert supervisor.wait(5)
+    assert supervisor.states[1].completed == 1
+    assert store.run_tasks(old_run)[0]["status"] == "pending"
+    assert store.run_tasks(selected_run)[0]["status"] == "done"
+
+
 def test_two_independent_workers_drain_queue(tmp_path):
     store = Store(tmp_path / "studio.db")
     project = store.create_project("Parallel", 'strategy("Parallel")')
@@ -67,6 +85,62 @@ def test_supervisor_rejects_shared_target(tmp_path):
     supervisor = WorkerSupervisor(Store(tmp_path / "studio.db"), ParallelFakeDriver())
     with pytest.raises(ValueError, match="bağımsız"):
         supervisor.start([WorkerAssignment(1, "target-1", (1,)), WorkerAssignment(2, "target-1", (1,))])
+
+
+def test_request_stop_is_nonblocking_and_preserves_next_task(tmp_path):
+    import time
+    entered, release = threading.Event(), threading.Event()
+    class SlowDriver(ParallelFakeDriver):
+        def configure(self, *args):
+            entered.set()
+            assert release.wait(5)
+    store = Store(tmp_path / "stop.db")
+    project = store.create_project("Stop", 'strategy("Stop")')
+    payload = {"study_id": "sid", "symbol": "OANDA:EURUSD", "timeframe": "15",
+               "inputs": {"in_0": 20}, "poll_interval": 0, "timeout": 1}
+    for key in ("current", "next"):
+        store.enqueue(project, key, payload)
+    supervisor = WorkerSupervisor(store, SlowDriver())
+    try:
+        supervisor.start([WorkerAssignment(1, "target-1", (project,))])
+        assert entered.wait(3)
+        before = time.monotonic()
+        supervisor.request_stop()
+        supervisor.request_stop()
+        assert time.monotonic() - before < 0.2
+        assert supervisor.running and supervisor.stopping
+        assert supervisor.states[1].status == "stopping"
+        assert not supervisor.wait(0)
+        assert supervisor.restart_failed() == []
+        assert store.counts(project) == {"running": 1, "pending": 1}
+    finally:
+        release.set()
+        assert supervisor.wait(5)
+    assert not supervisor.stopping
+    assert supervisor.stop_requested
+    assert supervisor.states[1].status == "stopped"
+    assert store.counts(project) == {"done": 1, "pending": 1}
+    assert store.tasks(project, "pending")[0]["attempts"] == 0
+
+
+def test_stop_during_target_guard_does_not_claim_a_task(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    def slow_guard(_target):
+        entered.set()
+        assert release.wait(5)
+    store = Store(tmp_path / "guard-stop.db")
+    project = store.create_project("Stop", 'strategy("Stop")')
+    store.enqueue(project, "waiting", {})
+    supervisor = WorkerSupervisor(store, ParallelFakeDriver(), target_guard=slow_guard)
+    try:
+        supervisor.start([WorkerAssignment(1, "target-1", (project,))])
+        assert entered.wait(3)
+        supervisor.request_stop()
+    finally:
+        release.set()
+        assert supervisor.wait(5)
+    assert store.counts(project) == {"pending": 1}
+    assert store.tasks(project)[0]["attempts"] == 0
 
 
 @pytest.mark.parametrize("failures", [1, 3])

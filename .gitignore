@@ -1,6 +1,7 @@
 .venv/
 .venv*/
 .pytest_cache/
+.test_tmp*/
 .live-smoke-profile*/
 __pycache__/
 *.py[cod]

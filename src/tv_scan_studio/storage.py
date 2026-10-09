@@ -6,10 +6,13 @@ import json
 import hashlib
 import sqlite3
 import time
+import tempfile
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Callable
+from . import run_history
+from . import scan_runs
 
 
 SCHEMA = """
@@ -100,6 +103,7 @@ class ClaimedTask:
     task_key: str
     payload: dict[str, Any]
     attempts: int
+    run_id: int | None = None
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -129,6 +133,12 @@ class Store:
             for row in connection.execute("SELECT id,pine_source FROM projects WHERE pine_hash IS NULL"):
                 digest = hashlib.sha256(row["pine_source"].encode("utf-8")).hexdigest()
                 connection.execute("UPDATE projects SET pine_hash=? WHERE id=?", (digest, row["id"]))
+            connection.executescript(run_history.SCHEMA)
+            connection.executescript(scan_runs.SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
+            run_history.migrate_legacy(connection)
+            scan_runs.migrate(connection)
+            connection.commit()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None,
@@ -191,37 +201,135 @@ class Store:
 
     def enqueue(self, project_id: int, task_key: str, payload: dict[str, Any]) -> bool:
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO tasks(project_id,task_key,payload,updated_at) VALUES(?,?,?,?)",
                 (project_id, task_key, json.dumps(payload, ensure_ascii=False), time.time()),
             )
             self._refresh_project_status(connection, project_id)
+            run_id = scan_runs.legacy_run(connection, project_id)
+            connection.execute("INSERT OR IGNORE INTO run_tasks(task_id,run_id,test_key) SELECT id,?,task_key "
+                               "FROM tasks WHERE project_id=? AND task_key=?", (run_id, project_id, task_key))
             return cursor.rowcount == 1
 
-    def enqueue_many(self, project_id: int, tasks: Any) -> int:
-        inserted = 0
+    def enqueue_many(self, project_id: int, tasks: Any, *, settings: dict[str, Any] | None = None,
+                     check_cancel: Callable[[], None] | None = None,
+                     progress: Callable[[int, int], None] | None = None,
+                     require_pending_subset: bool = False,
+                     expected_source: str | None = None,
+                     run_request: dict[str, Any] | None = None,
+                     return_run_id: bool = False) -> int | tuple[int, int]:
+        staged = 0
+        processed = 0
         now = time.time()
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            for task_key, payload in tasks:
-                cursor = connection.execute(
-                    "INSERT OR IGNORE INTO tasks(project_id,task_key,payload,updated_at) VALUES(?,?,?,?)",
-                    (project_id, task_key, json.dumps(payload, ensure_ascii=False), now),
-                )
-                inserted += cursor.rowcount
-            self._refresh_project_status(connection, project_id)
-            connection.commit()
-        return inserted
+        checkpoint = check_cancel or (lambda: None)
+        # Expensive generation/filtering never holds the application's write lock.
+        # The owned temporary directory is removed on success, error and cancellation.
+        with tempfile.TemporaryDirectory(prefix="tvscan-admission-") as directory:
+            staging_path = str(Path(directory) / "queue.sqlite")
+            with sqlite3.connect(staging_path, factory=_ClosingConnection) as staging:
+                staging.execute("CREATE TABLE queue(task_key TEXT PRIMARY KEY,payload TEXT NOT NULL)")
+                batch = []
+                def flush():
+                    nonlocal staged, processed
+                    if not batch:
+                        return
+                    checkpoint()
+                    cursor = staging.executemany("INSERT OR IGNORE INTO queue VALUES(?,?)", batch)
+                    staged += cursor.rowcount
+                    processed += len(batch)
+                    batch.clear()
+                    staging.commit()
+                    if progress is not None:
+                        progress(processed, staged)
+                    checkpoint()
+                for task_key, payload in tasks:
+                    checkpoint()
+                    identity = scan_runs.test_identity(payload, expected_source) if run_request is not None else task_key
+                    batch.append((identity, json.dumps(payload, ensure_ascii=False, allow_nan=False)))
+                    if len(batch) >= 256:
+                        flush()
+                flush()
+            checkpoint()
+            with self.connect() as connection:
+                connection.execute("ATTACH DATABASE ? AS admission", (staging_path,))
+                connection.execute("PRAGMA busy_timeout=50")
+                lock_deadline = time.monotonic() + 30
+                while True:
+                    checkpoint()
+                    try:
+                        connection.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as error:
+                        if "locked" not in str(error).lower() and "busy" not in str(error).lower():
+                            raise
+                        if time.monotonic() >= lock_deadline:
+                            raise ValueError("Veritabanı başka bir işlem tarafından kullanılıyor; kuyruk kaydedilmedi. İşlem bitince yeniden deneyin.") from error
+                cancelled = []
+                def sql_checkpoint():
+                    try:
+                        checkpoint()
+                        return 0
+                    except Exception as error:
+                        cancelled.append(error)
+                        return 1
+                connection.set_progress_handler(sql_checkpoint, 1000)
+                try:
+                    checkpoint()
+                    if expected_source is not None:
+                        project = connection.execute("SELECT pine_source FROM projects WHERE id=?", (project_id,)).fetchone()
+                        if project is None or project["pine_source"] != expected_source:
+                            raise ValueError("Strateji kaynağı hazırlık sırasında değişti; planı yeniden hazırlayın.")
+                    run_id, prefix = scan_runs.select_run(connection, project_id, run_request, expected_source or "")
+                    if require_pending_subset and connection.execute(
+                            "SELECT 1 FROM tasks t WHERE t.project_id=? AND t.status='pending' "
+                            "AND (? IS NULL OR t.id IN (SELECT task_id FROM run_tasks WHERE run_id=?)) "
+                            "AND NOT EXISTS(SELECT 1 FROM admission.queue q WHERE ? || q.task_key=t.task_key) LIMIT 1",
+                            (project_id, run_id if run_request is not None else None, run_id, prefix)).fetchone():
+                        raise ValueError("Bu stratejide başka bir taramadan bekleyen görevler var. Sonuçlar > Görevler bölümünde onları inceleyin; bu hazırlık eski görevleri otomatik çalıştırmaz.")
+                    if settings is not None:
+                        self.save_settings(project_id, settings, connection=connection)
+                    cursor = connection.execute(
+                        "INSERT OR IGNORE INTO tasks(project_id,task_key,payload,updated_at) "
+                        "SELECT ?,? || task_key,payload,? FROM admission.queue ORDER BY rowid", (project_id, prefix, now))
+                    inserted = cursor.rowcount
+                    connection.execute("INSERT OR IGNORE INTO run_tasks(task_id,run_id,test_key) "
+                        "SELECT t.id,?,q.task_key FROM admission.queue q JOIN tasks t ON t.project_id=? AND t.task_key=? || q.task_key",
+                        (run_id, project_id, prefix))
+                    checkpoint()
+                    self._refresh_project_status(connection, project_id)
+                    checkpoint()
+                except sqlite3.OperationalError:
+                    if cancelled:
+                        raise cancelled[0]
+                    raise
+                finally:
+                    # Rollback must not be interrupted by a cancellation handler.
+                    connection.set_progress_handler(None, 0)
+                checkpoint()
+                connection.commit()
+        return (inserted, run_id) if return_run_id else inserted
 
-    def save_settings(self, project_id: int, settings: dict[str, Any]) -> None:
-        now = time.time()
+    def scan_runs(self, project_id: int) -> list[dict[str, Any]]:
         with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM scan_runs WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
+        return [{**dict(row), "plan_snapshot": json.loads(row["plan_snapshot"])} for row in rows]
+
+    def run_tasks(self, run_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT t.*,r.run_id,r.test_key FROM tasks t JOIN run_tasks r ON r.task_id=t.id WHERE r.run_id=? ORDER BY t.id", (run_id,)).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
+
+    def save_settings(self, project_id: int, settings: dict[str, Any], *,
+                      connection: sqlite3.Connection | None = None) -> None:
+        now = time.time()
+        with (self.connect() if connection is None else nullcontext(connection)) as connection:
             current = connection.execute(
                 "SELECT settings FROM project_settings WHERE project_id=?", (project_id,)
             ).fetchone()
             merged = json.loads(current["settings"]) if current else {}
             merged.update(settings)
-            encoded = json.dumps(merged, ensure_ascii=False, sort_keys=True)
+            encoded = json.dumps(merged, ensure_ascii=False, sort_keys=True, allow_nan=False)
             connection.execute(
                 "INSERT INTO project_settings(project_id,settings,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(project_id) DO UPDATE SET settings=excluded.settings,updated_at=excluded.updated_at",
@@ -273,6 +381,9 @@ class Store:
 
     def recover_interrupted(self) -> int:
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for row in connection.execute("SELECT id FROM tasks WHERE status='running'").fetchall():
+                run_history.append_attempt(connection, row["id"], "interrupted")
             project_ids = [int(row[0]) for row in connection.execute(
                 "SELECT DISTINCT project_id FROM tasks WHERE status='running'"
             ).fetchall()]
@@ -286,7 +397,9 @@ class Store:
             return cursor.rowcount
 
     def claim_next(
-        self, worker_id: int, project_ids: list[int] | None = None
+        self, worker_id: int, project_ids: list[int] | None = None, *,
+        cancel_requested: Callable[[], bool] | None = None,
+        run_ids: list[int] | None = None,
     ) -> ClaimedTask | None:
         """Atomically reserve one pending task for a worker.
 
@@ -295,6 +408,9 @@ class Store:
         """
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if cancel_requested is not None and cancel_requested():
+                connection.rollback()
+                return None
             parameters: list[Any] = []
             assignment_filter = ""
             if project_ids is not None:
@@ -304,15 +420,27 @@ class Store:
                 placeholders = ",".join("?" for _ in project_ids)
                 assignment_filter = f" AND t.project_id IN ({placeholders})"
                 parameters.extend(project_ids)
+            if run_ids is not None:
+                if not run_ids:
+                    connection.rollback()
+                    return None
+                assignment_filter += " AND rt.run_id IN (" + ",".join("?" for _ in run_ids) + ")"
+                parameters.extend(run_ids)
             row = connection.execute(
-                "SELECT t.id,t.project_id,t.task_key,t.payload,t.attempts "
+                "SELECT t.id,t.project_id,t.task_key,t.payload,t.attempts,rt.run_id,sr.kind,sr.source_snapshot,p.pine_source "
                 "FROM tasks t JOIN projects p ON p.id=t.project_id "
+                "LEFT JOIN run_tasks rt ON rt.task_id=t.id LEFT JOIN scan_runs sr ON sr.id=rt.run_id "
                 "WHERE t.status='pending' AND p.status NOT IN ('paused','cancelled')" + assignment_filter + " "
                 "ORDER BY p.priority DESC,t.id LIMIT 1",
                 parameters,
             ).fetchone()
             if row is None:
                 connection.commit()
+                return None
+            if row["kind"] == "scan" and row["source_snapshot"] != row["pine_source"]:
+                raise ValueError("Koşunun strateji kaynağı değişti; eski koşu çalıştırılamaz. Yeni koşu hazırlayın.")
+            if cancel_requested is not None and cancel_requested():
+                connection.rollback()
                 return None
             updated = connection.execute(
                 "UPDATE tasks SET status='running',worker_id=?,attempts=attempts+1,"
@@ -324,6 +452,10 @@ class Store:
                 connection.rollback()
                 return None
             self._refresh_project_status(connection, int(row["project_id"]))
+            if cancel_requested is not None and cancel_requested():
+                connection.rollback()
+                return None
+            run_history.append_attempt(connection, int(row["id"]), "claimed")
             connection.commit()
             return ClaimedTask(
                 id=int(row["id"]),
@@ -331,6 +463,7 @@ class Store:
                 task_key=str(row["task_key"]),
                 payload=json.loads(row["payload"]),
                 attempts=int(row["attempts"]) + 1,
+                run_id=int(row["run_id"]) if row["run_id"] is not None else None,
             )
 
     def complete(
@@ -355,6 +488,8 @@ class Store:
             if row is None:
                 connection.rollback()
                 raise ValueError("Görev bu worker tarafından çalıştırılmıyor.")
+            run_history.append_result(connection, task_id, metrics, evidence, classification, True)
+            run_history.append_attempt(connection, task_id, "completed")
             connection.execute(
                 "INSERT INTO results(task_id,project_id,metrics,classification,verified,created_at) "
                 "VALUES(?,?,?,?,1,?) ON CONFLICT(task_id) DO UPDATE SET "
@@ -388,6 +523,7 @@ class Store:
                 connection.rollback()
                 raise ValueError("Görev bu worker tarafından çalıştırılmıyor.")
             payload = json.loads(row["payload"])
+            run_history.append_attempt(connection, task_id, "failed", detail={"error": error, "screenshot_path": screenshot_path})
             payload["last_error"] = error
             status = "manual_review" if int(row["attempts"]) >= max_attempts else "pending"
             connection.execute(
@@ -419,6 +555,8 @@ class Store:
             ).fetchone()
             if row is None:
                 connection.rollback(); raise ValueError("Görev bu worker tarafından çalıştırılmıyor.")
+            run_history.append_result(connection, task_id, metrics, evidence, "geçersiz", False)
+            run_history.append_attempt(connection, task_id, "invalidated", detail={"error": error})
             connection.execute(
                 "INSERT INTO results(task_id,project_id,metrics,classification,verified,created_at) "
                 "VALUES(?,?,?,?,0,?) ON CONFLICT(task_id) DO UPDATE SET metrics=excluded.metrics,"
@@ -441,6 +579,54 @@ class Store:
             self._resolve_validation(connection, task_id, False)
             self._refresh_project_status(connection, int(row["project_id"]))
             connection.commit()
+
+    def attempt_history(self, task_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM attempt_history WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
+        return [{**dict(row), "snapshot": json.loads(row["snapshot"])} for row in rows]
+
+    def result_history(self, task_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT h.*,rt.run_id,rt.test_key FROM result_history h "
+                "LEFT JOIN run_tasks rt ON rt.task_id=h.task_id WHERE h.task_id=? ORDER BY h.id", (task_id,)).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload"]), "metrics": json.loads(row["metrics"]),
+                 "evidence": json.loads(row["evidence"])} for row in rows]
+
+    def reevaluate_result(self, result_id: int, criteria: dict[str, Any]) -> int:
+        """Append a policy evaluation of frozen metrics; never enqueue or edit results."""
+        from .planner import ScanPlan
+        from .worker import classify
+        allowed = {"min_trades", "min_profit_factor", "min_win_rate_pct", "min_net_profit",
+                   "max_drawdown_pct", "max_drawdown_pct_exclusive", "max_daily_loss_pct", "max_total_loss_pct"}
+        if not isinstance(criteria, dict) or set(criteria) - allowed:
+            raise ValueError("Desteklenmeyen başarı ölçütü.")
+        from math import isfinite
+        for name, value in criteria.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+                raise ValueError(f"{name}: sonlu sayısal başarı ölçütü gerekli.")
+            if name == "min_trades" and (not isinstance(value, int) or value < 0):
+                raise ValueError("Minimum işlem sayısı negatif olmayan tam sayı olmalıdır.")
+            if name != "min_net_profit" and value < 0:
+                raise ValueError(f"{name}: başarı ölçütü negatif olamaz.")
+            if (name.endswith("pct") or name == "max_drawdown_pct_exclusive") and value > 100:
+                raise ValueError(f"{name}: yüzde 100'ü aşamaz.")
+        ScanPlan("policy", ("policy",), ("15",), {}, criteria=criteria).validate()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM result_history WHERE id=?", (result_id,)).fetchone()
+            if row is None:
+                raise ValueError("Sonuç geçmişi bulunamadı.")
+            payload = json.loads(row["payload"])
+            validation = payload.get("validation", {})
+            classification = classify(json.loads(row["metrics"]), criteria, validation) if row["verified"] else "geçersiz"
+            return run_history.append_evaluation(connection, result_id,
+                {"criteria": criteria, "validation": validation, "classifier": "classification-v1"}, classification)
+
+    def result_evaluations(self, result_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT e.*,p.definition FROM result_evaluations e "
+                "JOIN evaluation_policies p ON p.id=e.policy_id WHERE e.result_id=? ORDER BY e.id", (result_id,)).fetchall()
+        return [{**dict(row), "definition": json.loads(row["definition"])} for row in rows]
 
     def results(self, project_id: int, classification: str | Iterable[str] | None = None) -> list[dict[str, Any]]:
         query = (
@@ -746,7 +932,12 @@ class Store:
             })
         return grouped
 
-    def dashboard_stats(self, project_id: int | None = None) -> dict[str, Any]:
+    def run_performance(self, run_id: int | None, *, now=None) -> dict[str, Any]:
+        from .throughput import run_stats
+        with self.connect() as connection:
+            return run_stats(connection, run_id, now=now)
+
+    def dashboard_stats(self, project_id: int | None = None, *, run_id=None) -> dict[str, Any]:
         where = " WHERE project_id=?" if project_id is not None else ""
         parameters: tuple[Any, ...] = (project_id,) if project_id is not None else ()
         with self.connect() as connection:
@@ -754,36 +945,45 @@ class Store:
                 "SELECT status,COUNT(*) count FROM tasks" + where + " GROUP BY status",
                 parameters,
             ).fetchall()
-            completed = connection.execute(
-                "SELECT COUNT(*) count,MIN(started_at) first,MAX(finished_at) last "
-                "FROM tasks" + where + (" AND" if where else " WHERE") +
-                " status='done' AND started_at IS NOT NULL AND finished_at IS NOT NULL", parameters,
-            ).fetchone()
             candidate_where = " WHERE project_id=?" if project_id is not None else ""
             candidates = connection.execute(
                 "SELECT classification,COUNT(*) count FROM results" + candidate_where +
                 " GROUP BY classification", parameters,
             ).fetchall()
         count_map = {str(row["status"]): int(row["count"]) for row in counts}
-        done = int(completed["count"] or 0)
-        span = max(0.0, float(completed["last"] or 0) - float(completed["first"] or 0))
-        # A few near-instant offline runs are not a meaningful throughput/ETA sample.
-        tests_per_hour = done * 3600 / span if done >= 5 and span >= 60 else 0.0
-        remaining = count_map.get("pending", 0) + count_map.get("running", 0)
-        eta_seconds = remaining * 3600 / tests_per_hour if tests_per_hour > 0 else None
+        performance = self.run_performance(run_id)
         return {
-            "counts": count_map, "tests_per_hour": tests_per_hour,
-            "eta_seconds": eta_seconds,
+            "counts": count_map, "tests_per_hour": performance["tests_per_hour"],
+            "eta_seconds": performance["eta_seconds"],
             "candidates": {str(row["classification"]): int(row["count"]) for row in candidates},
         }
 
-    def observed_seconds_per_test(self, project_id: int | None = None) -> float | None:
-        condition = " AND project_id=?" if project_id is not None else ""
-        parameters: tuple[Any, ...] = (project_id,) if project_id is not None else ()
+    def observed_seconds_per_test(self, project_id: int | None = None, *, plan=None) -> float | None:
+        """Single-worker estimate only for an exact source/plan with claim evidence."""
+        if project_id is None or plan is None:
+            return None
+        project = self.project(project_id)
+        if project is None:
+            return None
+        comparable = scan_runs.comparable_plan(plan)
+        matching = next((run for run in self.scan_runs(project_id)
+            if run["kind"] == "scan" and run["source_snapshot"] == project["pine_source"]
+            and scan_runs.comparable_plan(run["plan_snapshot"]) == comparable), None)
+        if matching is None:
+            return None
+        performance = self.run_performance(matching["id"])
+        if not performance["average_tests_per_hour"]:
+            return None
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT AVG(finished_at-started_at) average FROM tasks "
-                "WHERE status='done' AND started_at IS NOT NULL AND finished_at>started_at" + condition,
-                parameters,
+                "SELECT AVG(h.created_at-c.created_at) average FROM tasks t "
+                "JOIN run_tasks rt ON rt.task_id=t.id JOIN results r ON r.task_id=t.id "
+                "JOIN result_history h ON h.task_id=t.id AND h.attempt_number=t.attempts "
+                "JOIN attempt_history c ON c.task_id=t.id AND c.attempt_number=t.attempts AND c.event='claimed' "
+                "WHERE rt.run_id=? AND t.status='done' AND r.verified=1 AND h.verified=1 "
+                "AND h.source_provenance='claim_snapshot' AND h.source_snapshot=? "
+                "AND h.id=(SELECT MAX(h2.id) FROM result_history h2 WHERE h2.task_id=t.id) "
+                "AND h.created_at>c.created_at",
+                (matching["id"], project["pine_source"]),
             ).fetchone()
         return float(row["average"]) if row and row["average"] is not None else None

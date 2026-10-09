@@ -26,13 +26,24 @@ class ScanWorker:
     target_guard: Callable[[str], None] | None = None
     download_directory: Path | None = None
     last_completed: bool = field(default=False, init=False)
+    cancel_requested: Callable[[], bool] | None = None
+    run_ids: list[int] | None = None
 
     def run_one(self) -> bool:
         self.last_completed = False
+        if self.cancel_requested is not None and self.cancel_requested():
+            return False
         # A moved/closed layout must not consume a queued task or retry budget.
         if self.target_guard is not None:
             self.target_guard(self.target_id)
-        task = self.store.claim_next(self.worker_id, self.project_ids)
+        if self.run_ids is not None:
+            task = self.store.claim_next(self.worker_id, self.project_ids,
+                cancel_requested=self.cancel_requested, run_ids=self.run_ids)
+        elif self.cancel_requested is None:
+            task = self.store.claim_next(self.worker_id, self.project_ids)
+        else:
+            task = self.store.claim_next(self.worker_id, self.project_ids,
+                                         cancel_requested=self.cancel_requested)
         if task is None:
             return False
         try:
@@ -104,6 +115,7 @@ class ScanWorker:
                 configure_dates(self.target_id, study_id, requested_dates)
             expected = dict(payload)
             expected["inputs"] = configured_inputs
+            normal_model = None
             if requested_dates:
                 project = self.store.project(task.project_id)
                 if project is None:
@@ -121,7 +133,17 @@ class ScanWorker:
                 trades = capture.trades
                 evidence = {
                     "symbol": payload["symbol"], "timeframe": payload["timeframe"],
-                    "inputs": configured_inputs, "period": requested_dates,
+                    "inputs": configured_inputs, "period": capture.report_period,
+                    "report_period": capture.report_period,
+                    "report_period_provenance": "deep_export_observed",
+                    "deep_model_evidence": getattr(capture, "model_evidence", None),
+                    "requested_date_range": requested_dates,
+                    "report_currency": capture.report_currency,
+                    "report_currency_provenance": "performance_sheet_row1" if capture.report_currency else "unknown",
+                    "open_trade_count": getattr(capture.report, "open_trade_count", None),
+                    "open_pnl": getattr(capture.report, "open_pnl", None),
+                    "tradingview_warning_state": capture.warning_state,
+                    "tradingview_warning_evidence": capture.warning_evidence,
                     "target_id": self.target_id, "study_id": study_id,
                     "report_source": "deep_xlsx", "deep_sha256": capture.report.sha256,
                     "chart_timezone": capture.chart_timezone,
@@ -147,9 +169,45 @@ class ScanWorker:
                     "symbol_identity": result.symbol_identity,
                     "report_fresh": result.report_fresh,
                     "inputs": result.inputs, "period": result.period,
+                    "tradingview_warning_state": result.warning_state,
+                    "tradingview_warning_evidence": result.warning_evidence,
+                    "report_currency": result.report_currency,
+                    "report_currency_provenance": "strategy_report_currency" if result.report_currency else "unknown",
                     "target_id": self.target_id, "study_id": study_id,
                     "cost_verification_scope": "not_verified",
                 }
+                read_normal_model = getattr(self.driver, "normal_report_model_state", None)
+                if callable(read_normal_model):
+                    if self.target_guard is None:
+                        raise ValueError("Normal rapor doğrulaması için worker koruması gerekli.")
+                    self.target_guard(self.target_id)
+                    normal_model = read_normal_model(self.target_id, study_id, result.inputs)
+                    self.target_guard(self.target_id)
+                    if (normal_model.closed_count != metrics.get("trades")
+                            or normal_model.open_count != metrics.get("observed_open_trade_count")
+                            or abs(normal_model.net_profit - float(metrics["net_profit"])) > 0.011):
+                        raise ValueError("Normal rapor modeli grafik özetiyle eşleşmiyor.")
+                    trades = normal_model.closed_trades
+                    evidence.update({
+                        "report_source": normal_model.provenance,
+                        "report_currency": normal_model.currency,
+                        "report_currency_provenance": normal_model.provenance,
+                        "open_trade_count": normal_model.open_count,
+                        "open_entry_commission": normal_model.open_entry_commission,
+                        "commission_paid": normal_model.commission_paid,
+                        "normal_report_digest": normal_model.report_digest,
+                    })
+                    metrics["open_entry_commission"] = normal_model.open_entry_commission
+                elif "observed_open_trade_count" in metrics:
+                    open_count = metrics["observed_open_trade_count"]
+                    if type(open_count) is not int or open_count < 0 or open_count > 0:
+                        self.store.invalidate(
+                            task.id, self.worker_id,
+                            "Normal Strategy Report açık işlem içeriyor veya açık işlem sayısı doğrulanamadı; "
+                            "kapanmış işlem analizi güvenle uzlaştırılamaz.",
+                            metrics, evidence,
+                        )
+                        return True
                 if apply_properties:
                     self.target_guard(self.target_id)
                     properties = self.driver.strategy_properties_ui_state(self.target_id)
@@ -162,9 +220,11 @@ class ScanWorker:
             )
             metrics.update(analysis)
             if analysis and isinstance(metrics.get("net_profit"), (int, float)):
-                delta = abs(float(metrics["net_profit"]) - float(analysis["trade_analysis_net_profit"]))
+                adjustment = normal_model.open_entry_commission if normal_model is not None else 0.0
+                delta = abs(float(metrics["net_profit"]) + adjustment - float(analysis["trade_analysis_net_profit"]))
                 metrics["trade_report_net_delta"] = delta
-                metrics["trade_pnl_reconciled"] = delta <= max(1.0, abs(float(metrics["net_profit"])) * 0.001)
+                tolerance = 0.011 if normal_model is not None else max(1.0, abs(float(metrics["net_profit"])) * 0.001)
+                metrics["trade_pnl_reconciled"] = delta <= tolerance
             core_error = _core_metrics_error(metrics)
             if core_error:
                 self.store.invalidate(task.id, self.worker_id, core_error, metrics, evidence)

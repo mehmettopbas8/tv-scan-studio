@@ -1,8 +1,30 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
+from tv_scan_studio.guided_tour import unobstructed_tour_position
 from tv_scan_studio.app import StudioWindow
 from tv_scan_studio.storage import Store
+
+
+def test_narrow_dialog_tour_moves_outside_without_covering_target():
+    window = QtCore.QRect(500, 220, 200, 340)
+    target = QtCore.QRect(510, 275, 180, 30)
+    size = QtCore.QSize(240, 200)
+    screen = QtCore.QRect(0, 0, 1240, 810)
+    point = unobstructed_tour_position(target, size, window, screen)
+    popup = QtCore.QRect(point, size)
+    assert screen.contains(popup)
+    assert not popup.intersects(target.adjusted(-3, -3, 3, 3))
+
+
+def test_large_list_tour_does_not_cover_list_when_dialog_space_is_insufficient():
+    window = QtCore.QRect(350, 180, 500, 410)
+    target = QtCore.QRect(365, 350, 470, 160)
+    size = QtCore.QSize(360, 220)
+    screen = QtCore.QRect(0, 0, 1240, 810)
+    popup = QtCore.QRect(unobstructed_tour_position(target, size, window, screen), size)
+    assert screen.contains(popup)
+    assert not popup.intersects(target.adjusted(-3, -3, 3, 3))
 
 
 def test_tour_anchors_gates_actions_and_can_reopen(tmp_path):

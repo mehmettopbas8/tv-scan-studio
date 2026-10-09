@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -194,13 +195,31 @@ def _xlsx_cell(reference: str, value: Any, *, header: bool = False) -> str:
         return f'<c r="{reference}" t="b"{style}><v>{int(value)}</v></c>'
     if isinstance(value, (int, float)) and math.isfinite(value):
         return f'<c r="{reference}"{style}><v>{value}</v></c>'
-    text = escape("".join(character for character in str(value)
-                          if ord(character) in (9, 10, 13) or ord(character) >= 32))
-    return f'<c r="{reference}" t="inlineStr"{style}><is><t>{text}</t></is></c>'
+    raw_text = "".join(character for character in str(value)
+                          if ord(character) in (9, 10, 13) or
+                          32 <= ord(character) <= 0xD7FF or
+                          0xE000 <= ord(character) <= 0xFFFD or ord(character) >= 0x10000)
+    if (len(raw_text.encode("utf-16-le")) // 2 > 32767 or raw_text.count("\n") > 253):
+        raise ValueError(f"Excel hücre metni sınırı aşıldı: {reference}.")
+    text = escape(raw_text).replace("\r", "&#13;")
+    return f'<c r="{reference}" t="inlineStr"{style}><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+def _xlsx_text_chunks(text: str):
+    """Respect Excel's UTF-16 cell size and line-feed limits without data loss."""
+    start = units = feeds = 0
+    for index, character in enumerate(text):
+        size = 2 if ord(character) > 0xFFFF else 1
+        if units + size > 32767 or feeds + (character == "\n") > 253:
+            yield text[start:index]
+            start, units, feeds = index, 0, 0
+        units += size
+        feeds += character == "\n"
+    yield text[start:]
 
 
 def _xlsx_sheet(stream, records: Iterable[dict[str, Any]], columns: list[str],
-                input_ids: tuple[str, ...]) -> int:
+                input_ids: tuple[str, ...], *, overflow=None, flattened=False) -> int:
     prefix = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
               '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
               '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
@@ -218,7 +237,20 @@ def _xlsx_sheet(stream, records: Iterable[dict[str, Any]], columns: list[str],
     write_row(1, columns, header=True)
     count = 0
     for count, record in enumerate(records, 1):
-        row = flatten_task_record(record, input_ids)
+        row = record if flattened else flatten_task_record(record, input_ids)
+        if overflow:
+            for column in columns:
+                value = row[column]
+                scalar = (value is None or isinstance(value, bool) or
+                          isinstance(value, (int, float)) and math.isfinite(value))
+                if not scalar:
+                    chunks = iter(_xlsx_text_chunks(str(value)))
+                    first = next(chunks)
+                    second = next(chunks, None)
+                    if second is not None:
+                        overflow(count + 1, column, first, second, chunks,
+                                 row.get("task_id"), row.get("task_key"))
+                        row[column] = f"[Tam metin: Teknik ayrıntılar; satır {count + 1}; alan {column}]"
         write_row(count + 1, (row[column] for column in columns))
     end = (f'</sheetData><autoFilter ref="A1:{_column_name(len(columns))}{count + 1}"/>'
            '</worksheet>')
@@ -227,9 +259,9 @@ def _xlsx_sheet(stream, records: Iterable[dict[str, Any]], columns: list[str],
 
 
 def _xlsx_width(column: str) -> int:
-    if column.endswith("_json") or column == "error":
+    if column.endswith("_json") or column in {"error", "Metin"}:
         return 48
-    if column == "task_key":
+    if column in {"task_key", "Alan", "Görev anahtarı"}:
         return 28
     if column in {"started_at", "finished_at", "period_timezone", "classification"}:
         return 30
@@ -248,7 +280,15 @@ def export_task_xlsx(records: Iterable[dict[str, Any]], destination: str | Path,
     iterator = iter(records)
     sheets = 0
     count = 0
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+    detail_names = {}
+    detail_columns = ["Kaynak sayfa", "Kaynak satır", "Alan", "Parça sırası", "Metin",
+                      "Görev kimliği", "Görev anahtarı"]
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", dir=path.parent) as details, \
+            zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        def overflow(row, column, first, second, remaining, task_id, task_key):
+            for part, text in enumerate(itertools.chain((first, second), remaining), 1):
+                details.write(json.dumps(dict(zip(detail_columns,
+                    (f"Tarama {sheets}", row, column, part, text, task_id, task_key))), ensure_ascii=False) + "\n")
         while True:
             batch = list(itertools.islice(iterator, 1))
             if not batch and sheets:
@@ -256,16 +296,29 @@ def export_task_xlsx(records: Iterable[dict[str, Any]], destination: str | Path,
             sheets += 1
             with archive.open(f"xl/worksheets/sheet{sheets}.xml", "w") as stream:
                 current = _xlsx_sheet(stream, itertools.chain(batch, itertools.islice(iterator, 1_048_574)),
-                                      columns, input_ids)
+                                      columns, input_ids, overflow=overflow)
             count += current
             if not batch:
                 break
+        details.seek(0)
+        detail_records = (json.loads(line) for line in details)
+        detail_index = 0
+        while True:
+            batch = list(itertools.islice(detail_records, 1))
+            if not batch:
+                break
+            sheets += 1
+            detail_index += 1
+            detail_names[sheets] = "Teknik ayrıntılar" + (f" {detail_index}" if detail_index > 1 else "")
+            with archive.open(f"xl/worksheets/sheet{sheets}.xml", "w") as stream:
+                _xlsx_sheet(stream, itertools.chain(batch, itertools.islice(detail_records, 1_048_574)),
+                            detail_columns, (), flattened=True)
         archive.writestr("[Content_Types].xml", _xlsx_content_types(sheets))
         archive.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?>'
                          '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
                          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
                          '</Relationships>')
-        archive.writestr("xl/workbook.xml", _xlsx_workbook(sheets))
+        archive.writestr("xl/workbook.xml", _xlsx_workbook(sheets, detail_names))
         archive.writestr("xl/_rels/workbook.xml.rels", _xlsx_workbook_rels(sheets))
         archive.writestr("xl/styles.xml", _XLSX_STYLES)
     return count
@@ -286,8 +339,9 @@ def _xlsx_content_types(sheets: int) -> str:
             f'{overrides}</Types>')
 
 
-def _xlsx_workbook(sheets: int) -> str:
-    entries = "".join(f'<sheet name="Tarama {index}" sheetId="{index}" r:id="rId{index}"/>'
+def _xlsx_workbook(sheets: int, names=None) -> str:
+    names = names or {}
+    entries = "".join(f'<sheet name="{names.get(index, f"Tarama {index}")}" sheetId="{index}" r:id="rId{index}"/>'
                       for index in range(1, sheets + 1))
     return ('<?xml version="1.0" encoding="UTF-8"?>'
             '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -310,11 +364,12 @@ _XLSX_STYLES = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
                 '<fonts count="2"><font><sz val="10"/><name val="Aptos"/><color rgb="FF3A322A"/></font>'
                 '<font><b/><sz val="10"/><name val="Aptos"/><color rgb="FF3A322A"/></font></fonts>'
-                '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+                '<fills count="3"><fill><patternFill patternType="none"/></fill>'
+                '<fill><patternFill patternType="gray125"/></fill>'
                 '<fill><patternFill patternType="solid"><fgColor rgb="FFF5ECDD"/><bgColor indexed="64"/></patternFill></fill></fills>'
                 '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
                 '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
                 '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
-                '<xf numFmtId="0" fontId="1" fillId="1" borderId="0" xfId="0" applyFill="1" applyFont="1" applyAlignment="1"><alignment wrapText="1" vertical="center"/></xf></cellXfs>'
+                '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1" applyAlignment="1"><alignment wrapText="1" vertical="center"/></xf></cellXfs>'
                 '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
                 '</styleSheet>')

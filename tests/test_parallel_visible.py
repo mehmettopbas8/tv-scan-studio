@@ -17,21 +17,38 @@ def test_parallel_choice_persisted_and_measured_rate(tmp_path, monkeypatch):
     studio.plan_project.setCurrentIndex(studio.plan_project.findData(project))
     studio.supervisor = SimpleNamespace(running=True, states={1: SimpleNamespace(completed=4, status="running", error=None),
                                                             2: SimpleNamespace(completed=2, status="failed", error="failure")})
-    studio._speed_started = 100
-    studio._speed_baseline = 0
-    studio._speed_elapsed = None
-    monkeypatch.setattr("tv_scan_studio.app.time.monotonic", lambda: 160)
+    studio._active_run_id = 1
+    studio._active_run_project = project
+    monkeypatch.setattr(store, "run_performance", lambda _run: {
+        "tests_per_hour": 360, "average_tests_per_hour": 360,
+        "verified_count": 6, "eta_seconds": None})
     studio._refresh_result_progress()
     assert "360 test/saat" in studio.run_performance.text()
     assert "aktif grafik: 1" in studio.run_performance.text()
     assert not studio.parallel_count.isEnabled()
     studio.supervisor.running = False
     studio._refresh_result_progress()
-    monkeypatch.setattr("tv_scan_studio.app.time.monotonic", lambda: 220)
     studio._refresh_result_progress()
     assert "360 test/saat" in studio.run_performance.text()
     studio.supervisor = None
     studio.window.close()
+
+
+def test_worker_counters_without_verified_run_do_not_claim_speed(tmp_path):
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = Store(tmp_path / "counters.db")
+    store.create_project("EMA", 'strategy("EMA")\nn=input.int(8)')
+    studio = StudioWindow(store)
+    studio.worker_timer.stop()
+    studio.supervisor = SimpleNamespace(running=True, states={
+        1: SimpleNamespace(completed=2000, status="running", error=None)})
+    try:
+        studio._refresh_result_progress()
+        assert "ölçüm bekleniyor" in studio.run_performance.text()
+        assert "2000" not in studio.run_performance.text()
+    finally:
+        studio.supervisor = None
+        studio.window.close()
 
 
 def test_parallel_preparation_uses_separate_retry_journal(tmp_path):

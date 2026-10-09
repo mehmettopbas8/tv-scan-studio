@@ -9,6 +9,7 @@ from copy import deepcopy
 from typing import Any, Iterator
 
 from .storage import Store
+from .pine import validate_input_value
 
 
 def _key(payload: dict[str, Any]) -> str:
@@ -16,15 +17,26 @@ def _key(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def followup_payloads(payload: dict[str, Any], alternative_symbol: str) -> Iterator[tuple[str, dict[str, Any]]]:
+def followup_payloads(payload: dict[str, Any], alternative_symbol: str, *, input_specs=None) -> Iterator[tuple[str, dict[str, Any]]]:
+    if input_specs is not None:
+        for input_id, value in payload.get("inputs", {}).items():
+            if input_id not in input_specs:
+                raise ValueError(f"{input_id}: kaynak ayarı bulunamadı.")
+            validate_input_value(input_specs[input_id], value)
     for input_id, value in payload.get("inputs", {}).items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
-        step = max(abs(value) * 0.05, 1 if isinstance(value, int) else 0.01)
+        spec = input_specs.get(input_id) if input_specs is not None else None
+        step = spec.step if spec is not None and spec.step is not None else max(abs(value) * 0.05, 1 if isinstance(value, int) else 0.01)
         for direction in (-1, 1):
             child = deepcopy(payload)
             candidate = value + direction * step
             child["inputs"][input_id] = int(round(candidate)) if isinstance(value, int) else round(candidate, 8)
+            if spec is not None:
+                try:
+                    validate_input_value(spec, child["inputs"][input_id])
+                except ValueError:
+                    continue
             child["validation_stage"] = "neighbor"
             yield "neighbor", child
     for multiplier in (1.5, 2.0):
@@ -63,8 +75,8 @@ def followup_payloads(payload: dict[str, Any], alternative_symbol: str) -> Itera
 
 
 def enqueue_followups(store: Store, parent_task_id: int, payload: dict[str, Any],
-                      alternative_symbol: str) -> int:
+                      alternative_symbol: str, *, input_specs=None) -> int:
     inserted = 0
-    for stage, child in followup_payloads(payload, alternative_symbol):
+    for stage, child in followup_payloads(payload, alternative_symbol, input_specs=input_specs):
         inserted += int(store.enqueue_validation(parent_task_id, stage, _key(child), child))
     return inserted

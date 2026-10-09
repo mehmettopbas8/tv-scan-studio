@@ -10,6 +10,19 @@ from tv_scan_studio.preparation import find_prepared_chart, PreparationState
 from tv_scan_studio.windows import worker_layout_candidates
 
 
+def test_scan_confirmation_names_period_timezone_and_effective_costs():
+    plan = SimpleNamespace(date_range={"from": "2026-09-07", "to": "2026-09-18"},
+        costs={"assumptions": {"analysis_timezone": "Europe/Istanbul", "initial_capital": 100000,
+            "position_size": 1, "commission_value": .01, "spread": 0, "slippage": 2,
+            "scenario": "Ağır stres"}})
+    text = StudioWindow._scan_confirmation_conditions(plan)
+    for expected in ("2026-09-07 – 2026-09-18", "Europe/Istanbul", "100000",
+                     "Komisyon (%): 0.01", "Spread: 0", "Kayma (tick): 2", "Ağır stres"):
+        assert expected in text
+    plan.date_range = None
+    assert "Grafikte erişilebilen geçmiş" in StudioWindow._scan_confirmation_conditions(plan)
+
+
 def test_friendly_timeframes_round_trip_without_changing_resolution():
     codes = ["1", "2", "15", "60", "240", "1D", "1W", "1M"]
     labels = ", ".join(StudioWindow._timeframe_label(code) for code in codes)
@@ -145,8 +158,9 @@ def test_default_preparation_does_not_adopt_mixed_strategy_layout():
                {"id": "2", "url": "https://www.tradingview.com/chart/dedicated/"}]
     project = {"pine_source": 'strategy("EMA")\nn=input.int(8,"Fast EMA")'}
     result = find_prepared_chart(driver, targets, project, preferred_chart_id="mixed")
-    assert result.chart_id == "dedicated"
+    assert result.chart_id is None
     assert result.state == PreparationState.ACTION_REQUIRED
+    assert find_prepared_chart(driver, targets, project).chart_id == "dedicated"
     assert find_prepared_chart(driver, targets[:1], project).target_id is None
 
 

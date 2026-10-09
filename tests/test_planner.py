@@ -57,6 +57,58 @@ def test_invalid_plan_is_rejected():
         ScanPlan("study", (), ("15",), {}).validate()
 
 
+def test_invalid_enqueue_preserves_existing_settings_and_project(tmp_path):
+    store = Store(tmp_path / "atomic.db")
+    project = store.create_project("Atomic", 'strategy("Atomic")')
+    store.save_settings(project, {"old": "preserved"})
+    before = store.project(project)
+    with pytest.raises(ValueError):
+        enqueue_plan(store, project, ScanPlan("study", (), ("15",), {}))
+    assert store.settings(project) == {"old": "preserved"}
+    assert store.project(project) == before
+    assert store.tasks(project) == []
+
+
+def test_generation_failure_rolls_back_settings_and_all_inserted_tasks(tmp_path, monkeypatch):
+    import tv_scan_studio.planner as planner
+    store = Store(tmp_path / "rollback.db")
+    project = store.create_project("Rollback", 'strategy("Rollback")')
+    store.save_settings(project, {"old": "preserved"})
+    before = store.project(project)
+    def failing_tasks(_plan, **_options):
+        yield "first", {"symbol": "X"}
+        raise RuntimeError("interrupted generation")
+    monkeypatch.setattr(planner, "iter_tasks", failing_tasks)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        enqueue_plan(store, project, plan(), settings={"input_ui": {"in_0": {"decision": "Tara"}}})
+    assert store.settings(project) == {"old": "preserved"}
+    assert store.project(project) == before
+    assert store.tasks(project) == []
+
+
+def test_successful_enqueue_commits_plan_and_ui_snapshot_together(tmp_path):
+    store = Store(tmp_path / "success.db")
+    project = store.create_project("Success", 'strategy("Success")')
+    ui = {"in_0": {"decision": "Tara", "values": [10, 20]}}
+    assert enqueue_plan(store, project, plan(), settings={"input_ui": ui}) == 16
+    assert store.settings(project)["input_ui"] == ui
+    assert store.settings(project)["input_values"] == plan().input_values
+    assert store.counts(project) == {"pending": 16}
+
+
+@pytest.mark.parametrize("changes", [
+    {"timeout": float("nan")}, {"timeout": float("inf")}, {"timeout": True},
+    {"poll_interval": float("nan")}, {"poll_interval": float("inf")},
+    {"stable_reads": 1.5}, {"stable_reads": True},
+    {"criteria": {"min_profit_factor": float("nan")}},
+    {"costs": {"assumptions": {"spread": float("inf")}}},
+])
+def test_plan_rejects_nonfinite_controls_and_invalid_read_count(changes):
+    base = {"study_id": "study", "symbols": ("X",), "timeframes": ("15",), "input_values": {}}
+    with pytest.raises(ValueError):
+        ScanPlan(**(base | changes)).validate()
+
+
 @pytest.mark.parametrize("changes,error", [
     ({"symbols": ("OANDA:EURUSD", "OANDA:EURUSD")}, "Aynı sembol"),
     ({"timeframes": ("15", "15")}, "Aynı timeframe"),

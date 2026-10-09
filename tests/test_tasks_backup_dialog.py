@@ -24,7 +24,11 @@ def test_task_filters_and_backup_restore_inside_dialog(tmp_path, monkeypatch):
     monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args: (str(backup), ""))
     studio = StudioWindow(store)
     before = store.counts(project)
+    real_exec = QtWidgets.QDialog.exec
     def inspect(dialog):
+        from tv_scan_studio.backup_dialog import BackupProgressDialog
+        if isinstance(dialog, BackupProgressDialog):
+            return real_exec(dialog)
         dialog.show(); application.processEvents()
         table = dialog.findChild(QtWidgets.QTableWidget, "backupTaskTable")
         states = dialog.findChild(QtWidgets.QComboBox, "backupTaskState")
@@ -42,6 +46,21 @@ def test_task_filters_and_backup_restore_inside_dialog(tmp_path, monkeypatch):
         assert Store(restored).saved_presets()[0]["name"] == "EMA 9"
         assert store.counts(project) == before
         assert studio.store.path == store.path
+        from tv_scan_studio.backup_selection import BackupSelection
+        selection = dialog.findChild(BackupSelection)
+        report = tmp_path / "selected-report.csv"
+        report.write_text("PF,1.4", encoding="utf-8")
+        selection.add_paths([report], "report")
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", lambda *args: (str(backup), ""))
+        dialog.findChild(QtWidgets.QPushButton, "createTaskBackup").click()
+        assert len(verify_backup(backup)["attachments"]) == 1
+        assert "1 ek dosya" in status.text()
+        second_restore = tmp_path / "with-files.db"
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", lambda *args: (str(second_restore), ""))
+        dialog.findChild(QtWidgets.QPushButton, "restoreTaskBackup").click()
+        assert "1 ek dosya ayrı klasöre" in status.text()
+        assert "otomatik içe aktarılmadı" in status.text()
+        assert list((tmp_path / "with-files-files" / "report").iterdir())[0].read_bytes() == report.read_bytes()
         dialog.hide()
         return 0
     monkeypatch.setattr(QtWidgets.QDialog, "exec", inspect)

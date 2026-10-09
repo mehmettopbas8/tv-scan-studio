@@ -29,6 +29,12 @@ def legacy_scan_record(source: dict, index: int, *, source_sha256: str) -> dict:
     error = source.get("error") or (description.get("error") if isinstance(description, dict) else description) or ""
     if not valid and not error:
         error = "Kaynak kayıtta hata ayrıntısı yok; geçmiş test geçersiz olarak işaretlenmiş."
+    phase = source.get("phase") or source.get("source_phase")
+    phase = phase if isinstance(phase, str) and phase.strip() else None
+    pine_hash = source.get("pine_sha256") or source.get("pine_hash") or source.get("historical_pine_sha256")
+    pine_hash = pine_hash.lower() if isinstance(pine_hash, str) else None
+    if pine_hash is not None and (len(pine_hash) != 64 or any(c not in "0123456789abcdef" for c in pine_hash)):
+        pine_hash = None
     return {
         "task_id": index, "task_key": "historical:" + identity,
         "status": "done" if valid else "failed",
@@ -42,26 +48,33 @@ def legacy_scan_record(source: dict, index: int, *, source_sha256: str) -> dict:
             "inputs": dict(source["params"]),
             "date_range": ((source.get("period") or {}).get("dateRange") or {}).get("backtest", {}),
             "research_source_id": source.get("preset_id"), "variant": source.get("variant"),
+            "source_phase": phase,
+            "costs": source.get("costs") or {"commission_pct": source.get("commission_pct"),
+                                             "friction_ticks": source.get("friction_ticks")},
             "historical_import": True,
         },
         "metrics": mapped,
         "evidence": {"scope": "Geçmiş arşiv; bu uygulamada yeniden doğrulanmadı",
                      "archive_sha256": source_sha256, "archive_row": index,
-                     "historical_pine_sha256": None, "legacy_record": original},
+                     "historical_pine_sha256": pine_hash, "legacy_record": original},
     }
 
 
-def iter_legacy_scan_records(path: str | Path):
+def iter_legacy_scan_records(path: str | Path, *, check_cancel=None):
     """Stream JSONL/gzip records, retaining the full original row as evidence."""
     path = Path(path)
     checksum = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            if check_cancel:
+                check_cancel()
             checksum.update(chunk)
     opener = gzip.open if path.suffix == ".gz" else open
     index = 0
     with opener(path, "rt", encoding="utf-8-sig") as stream:
         for line_number, line in enumerate(stream, 1):
+            if check_cancel:
+                check_cancel()
             if not line.strip():
                 continue
             try:

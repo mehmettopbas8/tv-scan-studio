@@ -79,6 +79,18 @@ def test_old_completed_report_is_rejected_until_new_report_even_with_identical_m
     assert result.metrics == old.metrics  # Identical outcomes are legal; stale objects are not.
 
 
+def test_report_currency_must_stabilize_with_metrics_before_verification():
+    usd = replace(snapshot(), report_currency="USD")
+    lira = replace(snapshot(), report_currency="TRY")
+    driver = FakeDriver([usd, usd, lira, lira, lira])
+    result = wait_for_verified_result(driver, "target-1", "study-1",
+        {"symbol": "OANDA:EURUSD", "timeframe": "15", "inputs": {"in_0": 20}},
+        timeout=1, poll_interval=0, stable_reads=3)
+    assert result.report_currency == "TRY"
+    with pytest.raises(StopIteration):
+        next(driver.snapshots)
+
+
 @pytest.mark.parametrize("fresh", [False, None])
 def test_stable_input_echo_without_report_freshness_cannot_verify(fresh):
     from tv_scan_studio.tradingview import VerificationMismatch
@@ -167,7 +179,8 @@ def test_delayed_symbol_can_verify_stable_results_without_relaxing_provider():
     assert result.symbol_identity["pro_name"] == "BIST:XU030D1!"
 
 
-def test_scan_worker_completes_a_verified_task(tmp_path):
+@pytest.mark.parametrize("warning_state", ["unknown", "present"])
+def test_scan_worker_completes_a_verified_task(tmp_path, warning_state):
     store = Store(tmp_path / "studio.db")
     project = store.create_project("Scan", 'strategy("Scan")')
     payload = {
@@ -176,13 +189,36 @@ def test_scan_worker_completes_a_verified_task(tmp_path):
         "criteria": {"min_trades": 60, "min_profit_factor": 1.4, "max_drawdown_pct": 5},
     }
     store.enqueue(project, "task-1", payload)
-    driver = FakeDriver([snapshot(), snapshot(), snapshot()])
+    warning = {"state": warning_state, "provenance": "strategy_report_dom"}
+    driver = FakeDriver([replace(snapshot(), warning_state=warning_state,
+                                 warning_evidence=warning) for _ in range(3)])
 
     assert ScanWorker(1, "target-1", store, driver, [project]).run_one() is True
     assert store.counts(project) == {"done": 1}
     assert store.results(project)[0]["classification"] == "hassas"
     assert store.results(project)[0]["evidence"]["target_id"] == "target-1"
+    assert store.results(project)[0]["evidence"]["tradingview_warning_state"] == warning_state
+    assert store.results(project)[0]["evidence"]["tradingview_warning_evidence"] == warning
+    task_id = store.results(project)[0]["task_id"]
+    assert store.result_history(task_id)[-1]["warning_state"] == warning_state
     assert driver.configured[0][0] == "target-1"
+
+
+@pytest.mark.parametrize("currency", ["USD", "TRY", None])
+def test_normal_worker_preserves_explicit_report_currency_and_history(tmp_path, currency):
+    store = Store(tmp_path / "currency.db")
+    project = store.create_project("Currency", 'strategy("Currency")')
+    store.enqueue(project, "currency-task", {
+        "study_id": "study-1", "symbol": "OANDA:EURUSD", "timeframe": "15",
+        "inputs": {"in_0": 20}, "timeout": 1, "poll_interval": 0,
+    })
+    driver = FakeDriver([replace(snapshot(), report_currency=currency)] * 3)
+    assert ScanWorker(1, "target-1", store, driver, [project]).run_one()
+    result = store.results(project)[0]
+    assert result["verified"] is True
+    assert result["evidence"]["report_currency"] == currency
+    assert result["evidence"]["report_currency_provenance"] == ("strategy_report_currency" if currency else "unknown")
+    assert store.result_history(result["task_id"])[-1]["evidence"]["report_currency"] == currency
 
 
 def test_layout_guard_blocks_configuration_when_tab_changes(tmp_path):
@@ -290,6 +326,8 @@ def test_dated_worker_uses_deep_capture_not_chart_summary(tmp_path, monkeypatch)
                 metrics={"trades": 100, "profit_factor": 1.5, "win_rate_pct": 45,
                          "max_drawdown_pct": 4, "net_profit": 1000}, sha256="fresh-task-xlsx"),
             trades=(), chart_timezone="UTC", verified_changed_inputs=("in_0",), symbol_identity=None,
+            report_period={"from_ms": 1735689600000, "to_ms": 1767225599999},
+            report_currency=None, warning_state="unknown", warning_evidence=None,
         )
     monkeypatch.setattr(worker_module, "capture_task_deep_export", fake_capture)
     guard = lambda target: None
@@ -300,6 +338,10 @@ def test_dated_worker_uses_deep_capture_not_chart_summary(tmp_path, monkeypatch)
     assert result["verified"] is True
     assert result["evidence"]["report_source"] == "deep_xlsx"
     assert result["evidence"]["deep_sha256"] == "fresh-task-xlsx"
+    assert result["evidence"]["period"] == {"from_ms": 1735689600000, "to_ms": 1767225599999}
+    assert result["evidence"]["report_period_provenance"] == "deep_export_observed"
+    assert result["evidence"]["requested_date_range"] == {"from": "2025-01-01", "to": "2025-12-31"}
+    assert result["evidence"]["tradingview_warning_state"] == "unknown"
     assert result["evidence"]["cost_verification_scope"] == "strategy_properties_ui_and_xlsx_spread_unverified"
     assert calls[0]["changed_input_ids"] == {"in_0"}
     assert calls[0]["guard"] is guard
@@ -470,12 +512,22 @@ def test_deep_report_ui_state_parses_visible_key_stats_and_rejects_ambiguity():
         "maxDrawdown": "Max drawdown28.72USD0.03%",
         "profitableTrades": "Profitable trades50.00%14/28",
         "profitFactor": "Profit factor1.328",
+        "grossProfit": "Gross profit117.91USD", "grossLoss": "Gross loss100.00USD",
     }
     result = driver.deep_report_ui_state("worker-2")
     assert result.date_label == "Sep 7, 2026 — Sep 20, 2026"
     assert result.update_pending is False
+    assert result.total_pnl == 17.91
     assert result.metrics == {"net_profit": 17.91, "max_drawdown_pct": 0.03,
                               "win_rate_pct": 50, "trades": 28, "profit_factor": 1.328}
+    driver._motor.result["totalPnl"] = "Total PnL−632.09USD−0.63%"
+    with_open = driver.deep_report_ui_state("worker-2")
+    assert with_open.metrics["net_profit"] == 17.91
+    assert with_open.total_pnl == -632.09
+    saved = driver._motor.result.pop("grossProfit")
+    with pytest.raises(TradingViewError, match="temel metrik"):
+        driver.deep_report_ui_state("worker-2")
+    driver._motor.result["grossProfit"] = saved
     driver._motor.result = {**driver._motor.result, "pending": None}
     with pytest.raises(TradingViewError, match="güncelleme/tarih"):
         driver.deep_report_ui_state("worker-2")
@@ -568,7 +620,7 @@ def test_strategy_properties_ui_reader_closes_without_saving(monkeypatch, label,
     driver.target_guard = lambda target: actions.append(("guard", target))
     values = {"capital": "100,000", "size": "2", "sizeType": "Quantity",
               "commission": "0.01", "commissionType": label, "slippage": "2"}
-    responses = iter((True, values, True))
+    responses = iter((True, values, True, True))
     driver._motor = SimpleNamespace(_eval=lambda target, script: actions.append(
         ("eval", target, script)) or next(responses))
     monkeypatch.setattr(tradingview.time, "sleep", lambda _seconds: None)
@@ -576,8 +628,8 @@ def test_strategy_properties_ui_reader_closes_without_saving(monkeypatch, label,
     assert state.commission_type == expected
     assert (state.initial_capital, state.position_size, state.commission_value,
             state.slippage_ticks) == (100000, 2, 0.01, 2)
-    assert [item[0] for item in actions] == ["guard", "eval", "guard", "eval", "guard", "eval"]
-    assert "properties_close_not_unique" in actions[-1][2]
+    assert [item[0] for item in actions] == ["guard", "eval", "guard", "eval", "guard", "eval", "guard", "eval"]
+    assert "return ![...document.querySelectorAll" in actions[-1][2]
 
 
 @pytest.mark.parametrize('mismatch', [False, True])

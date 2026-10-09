@@ -100,6 +100,11 @@ def find_prepared_chart(driver, targets, project, *, preferred_chart_id=None, ex
     for target, chart_id in safe.items():
         if target in excluded_targets:
             continue
+        # A recorded identity is ownership, not a ranking hint. An unfinished
+        # owned chart must be resumed rather than replaced by another matching
+        # layout (which may belong to a previous run or a personal session).
+        if preferred_chart_id is not None and chart_id != preferred_chart_id:
+            continue
         item = inventory.get(target, {})
         strategies = item.get("strategies", [])
         # Default preparation owns one unambiguous strategy/report. A matching
@@ -111,7 +116,6 @@ def find_prepared_chart(driver, targets, project, *, preferred_chart_id=None, ex
                                                  len(parse_strategy_inputs(project["pine_source"])))]
         if len(matches) == 1:
             candidates.append((target, chart_id, matches[0]))
-    candidates.sort(key=lambda candidate: candidate[1] != preferred_chart_id)
     if candidates:
         target, chart, study = candidates[0]
         return PreparationResult(PreparationState.ACTION_REQUIRED,

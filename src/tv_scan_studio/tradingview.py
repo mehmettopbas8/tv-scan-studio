@@ -5,10 +5,11 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -56,6 +57,9 @@ class StrategySnapshot:
     report_source: str = "chart"
     symbol_identity: dict[str, Any] | None = None
     report_fresh: bool | None = None
+    warning_state: str = "unknown"
+    warning_evidence: dict[str, Any] | None = None
+    report_currency: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +67,43 @@ class DeepReportUiState:
     date_label: str
     metrics: dict[str, float | int]
     update_pending: bool
+    total_pnl: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeepReportModelState:
+    request_from_ms: int
+    request_end_exclusive_ms: int
+    selected_dates: dict[str, str]
+    chart_timezone: str
+    strategy_id: str
+    inputs: dict[str, Any]
+    symbol: str
+    timeframe: str
+    status_type: int
+    update_pending: bool
+    initial_loading: bool
+    settings: dict[str, Any]
+    trades: tuple[dict[str, Any], ...]
+    performance: dict[str, Any]
+    currency: str | None
+    provenance: str = "visible_deep_manager"
+
+
+@dataclass(frozen=True, slots=True)
+class NormalReportModelState:
+    """Closed trades from the UI-bound normal report, never synthetic open exits."""
+
+    closed_trades: tuple[dict[str, Any], ...]
+    closed_count: int
+    open_count: int
+    open_entry_commission: float
+    net_profit: float
+    commission_paid: float
+    currency: str
+    inputs: dict[str, Any]
+    provenance: str = "visible_normal_report_model"
+    report_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +187,35 @@ class GncZihinDriver:
         if self._motor._eval(target_id, expression, await_promise=True) is not True:
             raise TradingViewError("Yeni layout isteği doğrulanamadı.")
 
+    def _find_saved_private_source(self, target_id: str, expected: str) -> tuple[str, str] | None:
+        """Reconcile an ambiguous save by exact name, version and full source.
+
+        Never rename/overwrite scripts, and never resolve ambiguous identities by
+        picking the first result. A failed catalogue read must not permit a save.
+        """
+        rows = self._motor._eval(target_id,
+            "TradingViewApi._pineEditorApi.listSavedScripts()", await_promise=True)
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise TradingViewError("Özel script listesi doğrulanamadı; yeni kayıt oluşturulmadı.")
+        candidates = [row for row in rows
+                      if row.get("scriptName") == "TV Scan Source " + expected[:20]]
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise TradingViewError("Aynı adlı birden fazla özel test scripti var; kaynak seçimi gerekli.")
+        row = candidates[0]
+        pine_id, version = row.get("scriptIdPart"), row.get("version")
+        if not isinstance(pine_id, str) or not pine_id.startswith("USER;") or not version:
+            raise TradingViewError("Kayıtlı özel test scriptinin kimliği doğrulanamadı.")
+        saved = self._motor._eval(target_id,
+            "TradingViewApi._pineEditorApi.getSource(" + json.dumps(pine_id) + "," +
+            json.dumps(str(version)) + ")", await_promise=True)
+        if (not isinstance(saved, dict) or not isinstance(saved.get("source"), str)
+                or str(saved.get("version")) != str(version)
+                or pine_source_hash(saved["source"]) != expected):
+            raise TradingViewError("Aynı adlı özel test scriptinin kaynağı farklı veya doğrulanamadı; mevcut kayıt değiştirilmedi.")
+        return pine_id, str(version)
+
     def load_private_source(self, target_id: str, source: str, *, journal: dict,
                             persist: Callable[[dict], None], guard: Callable[[str], None]) -> dict:
         """Save a separate private script once, then attach only to an owned chart.
@@ -164,6 +234,12 @@ class GncZihinDriver:
             raise TradingViewError("Hazırlık kaynağı değişmiş; önceki özel script korunuyor.")
         pine_id = journal.get("pine_id")
         version = journal.get("version")
+        if not pine_id:
+            recovered = self._find_saved_private_source(target_id, expected)
+            if recovered:
+                pine_id, version = recovered
+                journal.update(source_hash=expected, pine_id=pine_id, version=version)
+                persist(dict(journal))
         if not pine_id:
             if journal.get("save_requested"):
                 raise TradingViewError("Önceki özel script kaydı tamamlanmış olabilir. Kayıt incelenmeden yeni bir kopya oluşturulmadı.")
@@ -252,29 +328,314 @@ class GncZihinDriver:
           return {dateLabel:dateButtons[0].getAttribute('aria-label'),
             deep:/deep\s*$/i.test((dateButtons[0].textContent||'').trim()),pending,
             totalPnl:stat('Total PnL'),maxDrawdown:stat('Max drawdown'),
-            profitableTrades:stat('Profitable trades'),profitFactor:stat('Profit factor')};
+            profitableTrades:stat('Profitable trades'),profitFactor:stat('Profit factor'),
+            grossProfit:stat('Gross profit'),grossLoss:stat('Gross loss')};
         })()""")
         if not isinstance(data, dict) or data.get("error") or not data.get("deep"):
             raise TradingViewError("Deep Strategy Report görünür ve benzersiz değil.")
         if type(data.get("pending")) is not bool or not isinstance(data.get("dateLabel"), str):
             raise TradingViewError("Deep Strategy Report güncelleme/tarih durumu okunamadı.")
-        raw = [data.get(key) for key in ("totalPnl", "maxDrawdown", "profitableTrades", "profitFactor")]
+        raw = [data.get(key) for key in ("totalPnl", "maxDrawdown", "profitableTrades", "profitFactor",
+                                        "grossProfit", "grossLoss")]
         if not all(isinstance(value, str) and value for value in raw):
             raise TradingViewError("Deep Strategy Report temel metrikleri okunamadı.")
         def number(value: str) -> float:
             match = re.search(r"[-+−]?\d[\d,]*(?:\.\d+)?", value)
             if not match:
                 raise TradingViewError("Deep Strategy Report sayı biçimi okunamadı.")
-            return float(match.group().replace("−", "-").replace(",", ""))
+            result = float(match.group().replace("−", "-").replace(",", ""))
+            if not math.isfinite(result):
+                raise TradingViewError("Deep Strategy Report sayısı sonlu değil.")
+            return result
         total = re.search(r"(\d+)\s*/\s*(\d+)", raw[2])
         percentages = [re.findall(r"[-+−]?\d[\d,]*(?:\.\d+)?(?=\s*%)", value)
                        for value in (raw[1], raw[2])]
         if not total or not all(percentages):
             raise TradingViewError("Deep Strategy Report işlem/DD biçimi okunamadı.")
-        metrics = {"net_profit": number(raw[0]), "max_drawdown_pct": number(percentages[0][0]),
+        gross_profit, gross_loss = number(raw[4]), number(raw[5])
+        if gross_profit < 0 or gross_loss < 0:
+            raise TradingViewError("Deep Strategy Report brüt kâr/zarar işareti geçersiz.")
+        # Key-stat Total PnL includes the open position; XLSX Net profit and
+        # closed-trade analytics do not. Read closed amounts independently.
+        metrics = {"net_profit": round(gross_profit - gross_loss, 8), "max_drawdown_pct": number(percentages[0][0]),
                    "win_rate_pct": number(percentages[1][0]), "trades": int(total.group(2)),
                    "profit_factor": number(raw[3].split("Profit factor", 1)[-1])}
-        return DeepReportUiState(data["dateLabel"], metrics, data["pending"])
+        return DeepReportUiState(data["dateLabel"], metrics, data["pending"], number(raw[0]))
+
+    def normal_report_model_state(self, target_id: str, study_id: str,
+                                  expected_inputs: dict[str, Any]) -> NormalReportModelState:
+        """Bind the visible normal report to one active study and split open trades.
+
+        The compact chart report lacks an open-trade flag. The UI-bound report
+        carries explicit ``isOpen: true`` only for synthetic open rows.
+        """
+        if self.target_guard is None:
+            raise TradingViewError("Normal rapor modeli için worker koruması gerekli.")
+        script = r'''(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          const leaves=[...document.querySelectorAll('*')].filter(e=>visible(e)&&e.children.length===0&&
+            (e.textContent||'').trim()==='Key stats'&&!e.closest('[data-name="widgetbar-pages-with-tabs"]'));
+          if(leaves.length!==1)return {error:'normal_key_stats_not_unique'};
+          const keys=Object.keys(leaves[0]).filter(k=>k.startsWith('__reactFiber$'));
+          if(keys.length!==1)return {error:'normal_fiber_not_unique'};
+          let fiber=leaves[0][keys[0]];const reports=new Set(),apis=new Set();
+          for(let i=0;fiber&&i<30;i++,fiber=fiber.return){
+            let hook=fiber.memoizedState;
+            for(let j=0;hook&&j<15;j++,hook=hook.next){
+              const value=hook.memoizedState;
+              if(value&&typeof value==='object'&&value.settings&&value.performance&&Array.isArray(value.trades))
+                reports.add(value);
+            }
+            const value=fiber.memoizedProps?.value||fiber.memoizedProps?.api;
+            if(value&&typeof value==='object'&&'_deepBacktestingManager' in value)apis.add(value);
+          }
+          if(reports.size!==1||apis.size!==1)return {error:'normal_model_not_unique'};
+          const report=[...reports][0],api=[...apis][0],active=api._activeStrategy?._owner?._value;
+          if(api._sourceStreamKey?._value!=='strategy-facade'||api._isDeepBacktesting!==false||
+             active?.id!==STUDY_ID||api._activeStrategyStatus?._owner?._value?.type!==2||
+             api._reportData?._owner?._value!==report||
+             api._activeStrategyReportData?._owner?._value!==report)
+            return {error:'normal_report_binding_mismatch'};
+          const descriptors=api._activeStrategyInputsValues?._owner?._value;
+          if(!descriptors||typeof descriptors!=='object'||Array.isArray(descriptors))
+            return {error:'normal_inputs_missing'};
+          const inputs=Object.entries(descriptors).filter(([id])=>/^in_\d+$/.test(id))
+            .map(([id,item])=>({id,value:item?.value,studyId:item?.studyId}));
+          return {bound:true,inputs,first_trade_index:report.firstTradeIndex,
+            trades:report.trades,performance:{net_profit:report.performance?.all?.netProfit,
+              closed_count:report.performance?.all?.totalTrades,
+              open_count:report.performance?.all?.totalOpenTrades,
+              commission_paid:report.performance?.all?.commissionPaid},currency:report.currency};
+        })()'''.replace("STUDY_ID", json.dumps(study_id))
+
+        def read() -> NormalReportModelState:
+            self.target_guard(target_id)
+            data = self._motor._eval(target_id, script)
+            self.target_guard(target_id)
+            if not isinstance(data, dict) or data.get("bound") is not True:
+                raise TradingViewError(f"Normal rapor modeli bağlanamadı: {data.get('error') if isinstance(data, dict) else 'shape'}")
+            descriptors = data.get("inputs")
+            if not isinstance(descriptors, list) or not descriptors:
+                raise TradingViewError("Normal rapor Pine inputları eksik.")
+            inputs = {}
+            for item in descriptors:
+                if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                        or not re.fullmatch(r"in_\d+", item["id"])
+                        or item["id"] in inputs or item.get("studyId") != study_id
+                        or type(item.get("value")) not in {str, bool, int, float}):
+                    raise TradingViewError("Normal rapor Pine input kimliği belirsiz.")
+                if type(item["value"]) is float and not math.isfinite(item["value"]):
+                    raise TradingViewError("Normal rapor Pine input değeri geçersiz.")
+                inputs[item["id"]] = item["value"]
+            if set(inputs) != set(expected_inputs) or any(
+                    inputs[key] != value or type(inputs[key]) is not type(value)
+                    for key, value in expected_inputs.items()):
+                raise TradingViewError("Normal rapor Pine inputları görevle eşleşmiyor.")
+            performance = data.get("performance")
+            trades = data.get("trades")
+            if (not isinstance(performance, dict) or not isinstance(trades, list)
+                    or type(data.get("first_trade_index")) is not int
+                    or data["first_trade_index"] != 0):
+                raise TradingViewError("Normal rapor işlem dizini doğrulanamadı.")
+            closed_count, open_count = performance.get("closed_count"), performance.get("open_count")
+            if (type(closed_count) is not int or type(open_count) is not int
+                    or closed_count < 0 or open_count < 0
+                    or len(trades) != closed_count + open_count):
+                raise TradingViewError("Normal rapor açık/kapanmış işlem sayısı eşleşmiyor.")
+            def finite(value: Any) -> bool:
+                return type(value) in {int, float} and math.isfinite(value)
+            net, paid = performance.get("net_profit"), performance.get("commission_paid")
+            if not finite(net) or not finite(paid) or paid < 0:
+                raise TradingViewError("Normal rapor net kâr/komisyon değeri geçersiz.")
+            closed: list[dict[str, Any]] = []
+            opened = 0
+            numbers: set[int] = set()
+            commissions = 0.0
+            open_commission = 0.0
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    raise TradingViewError("Normal rapor işlem biçimi geçersiz.")
+                number = trade.get("tradeNumber")
+                entry, exit_ = trade.get("entry"), trade.get("exit")
+                profit_data = trade.get("profit")
+                if not isinstance(profit_data, dict):
+                    raise TradingViewError("Normal rapor işlem kârı biçimi geçersiz.")
+                profit = profit_data.get("value")
+                commission = trade.get("commission")
+                if (type(number) is not int or number < 1 or number in numbers
+                        or not isinstance(entry, dict) or not isinstance(exit_, dict)
+                        or type(entry.get("time")) is not int or type(exit_.get("time")) is not int
+                        or entry["time"] > exit_["time"]
+                        or not finite(profit) or not finite(commission) or commission < 0):
+                    raise TradingViewError("Normal rapor işlem/komisyon kaydı geçersiz.")
+                numbers.add(number)
+                commissions += commission
+                if trade.get("isOpen") is True:
+                    opened += 1
+                    open_commission += commission
+                elif "isOpen" in trade:
+                    raise TradingViewError("Normal rapor açık işlem işareti belirsiz.")
+                else:
+                    side = {"le": "long", "se": "short"}.get(entry.get("type"))
+                    if side is None or exit_.get("type") != ("lx" if side == "long" else "sx"):
+                        raise TradingViewError("Normal rapor kapanmış işlem yönü belirsiz.")
+                    closed.append({"e": {"tm": entry["time"], "tp": side, "c": str(entry.get("id") or "")},
+                                   "x": {"tm": exit_["time"]}, "tp": {"v": float(profit)}})
+            if (numbers != set(range(1, len(trades) + 1)) or len(closed) != closed_count
+                    or opened != open_count or abs(commissions - paid) > 0.011
+                    or abs(sum(item["tp"]["v"] for item in closed) - open_commission - net) > 0.011):
+                raise TradingViewError("Normal rapor işlem/komisyon toplamı uzlaşmıyor.")
+            from .report_currency import report_currency_code
+            currency = report_currency_code(data.get("currency"))
+            if currency is None:
+                raise TradingViewError("Normal rapor para birimi doğrulanamadı.")
+            try:
+                digest = hashlib.sha256(json.dumps(data, sort_keys=True, allow_nan=False,
+                                                   ensure_ascii=False).encode()).hexdigest()
+            except (TypeError, ValueError) as exc:
+                raise TradingViewError("Normal rapor modeli sonlu ve kararlı değil.") from exc
+            return NormalReportModelState(tuple(closed), closed_count, open_count,
+                                          open_commission, float(net), float(paid), currency, inputs,
+                                          report_digest=digest)
+
+        first, second = read(), read()
+        if first != second:
+            raise TradingViewError("Normal rapor modeli iki okumada değişti.")
+        return second
+
+    def deep_report_model_state(self, target_id: str, study_id: str) -> DeepReportModelState:
+        """Read the visible Deep manager, never normal study reportData.
+
+        The observed React hook must reference the manager's actual Deep report.
+        Selected civil dates, request UTC bounds and observed market bounds stay
+        distinct. No private Pine source is returned. Two guarded reads must agree.
+        """
+        if self.target_guard is None:
+            raise TradingViewError("Deep rapor modeli için worker koruması gerekli.")
+        script = r'''(()=>{
+          const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+          const leaves=[...document.querySelectorAll('*')].filter(e=>visible(e)&&e.children.length===0&&
+            (e.textContent||'').trim()==='Key stats'&&!e.closest('[data-name="widgetbar-pages-with-tabs"]'));
+          if(leaves.length!==1)return {error:'deep_key_stats_not_unique'};
+          const keys=Object.keys(leaves[0]).filter(k=>k.startsWith('__reactFiber$'));
+          if(keys.length!==1)return {error:'deep_fiber_not_unique'};
+          let fiber=leaves[0][keys[0]],report=null;const apis=new Set(),contexts=new Set();
+          for(let i=0;fiber&&i<30;i++,fiber=fiber.return){
+            let hook=fiber.memoizedState;
+            for(let j=0;hook&&j<15;j++,hook=hook.next){
+              const value=hook.memoizedState;
+              if(value&&typeof value==='object'&&value.settings&&value.performance&&Array.isArray(value.trades)){
+                if(report&&report!==value)return {error:'deep_hook_report_not_unique'};report=value;
+              }
+            }
+            const value=fiber.memoizedProps?.value||fiber.memoizedProps?.api;
+            if(value&&typeof value==='object'&&'_deepBacktestingManager' in value)apis.add(value);
+            if(value&&typeof value==='object'&&'isDeepHistoryMode' in value)contexts.add(value);
+          }
+          if(!report||apis.size!==1||contexts.size!==1)return {error:'deep_model_not_unique'};
+          const api=[...apis][0],ctx=[...contexts][0],manager=api._deepBacktestingManager;
+          if(api._sourceStreamKey?._value!=='deep-backtesting'||api._isDeepBacktesting!==true||
+             ctx.isDeepHistoryMode!==true||manager?._reportDataDeepBacktesting?._value!==report)
+            return {error:'deep_report_reference_mismatch'};
+          const active=api._activeStrategy?._owner?._value;
+          const values=manager._activeStrategyInputs?._owner?._value?.inputs;
+          if(!values||typeof values!=='object'||Array.isArray(values))return {error:'deep_inputs_missing'};
+          const inputs={};
+          for(const [key,value] of Object.entries(values))if(/^in_\d+$/.test(key)){
+            if(!value||typeof value!=='object'||!Object.prototype.hasOwnProperty.call(value,'v'))
+              return {error:'deep_input_shape_unknown'};
+            inputs[key]=value.v;
+          }
+          const dates=ctx.dateRange;
+          if(!(dates?.from instanceof Date)||!(dates?.to instanceof Date))return {error:'deep_dates_missing'};
+          const civil=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+          const resolution=manager._resolution?._owner?._value;
+          const rawSymbol=manager._symbolString?._owner?._value;
+          if(typeof rawSymbol!=='string'||!rawSymbol.startsWith('={'))return {error:'deep_symbol_shape_unknown'};
+          let symbol;try{symbol=JSON.parse(rawSymbol.slice(1)).symbol;}catch{return {error:'deep_symbol_invalid'};}
+          return {bound:true,request_from_ms:manager._fromDate,request_end_exclusive_ms:manager._toDate,
+            selected_dates:{from:civil(dates.from),to:civil(dates.to)},
+            chart_timezone:manager._timezone?._owner?._value,strategy_id:active?.id,inputs,symbol,
+            timeframe:resolution?._kind==='minutes'?String(resolution._multiplier):null,
+            status_type:manager._statusDeepBacktesting?._value?.type,
+            update_pending:ctx.manualUpdatePendingRef?.current,
+            initial_loading:manager._isInitialLoadingReport?._value,
+            settings:report.settings,trades:report.trades,performance:report.performance,currency:report.currency};
+        })()'''
+
+        def read() -> DeepReportModelState:
+            self.target_guard(target_id)
+            data = self._motor._eval(target_id, script)
+            self.target_guard(target_id)
+            if not isinstance(data, dict) or data.get("error") or data.get("bound") is not True:
+                raise TradingViewError("Bağımsız Deep rapor modeli doğrulanamadı.")
+            if (data.get("strategy_id") != study_id or type(data.get("status_type")) is not int
+                    or data["status_type"] != 2 or data.get("update_pending") is not False
+                    or data.get("initial_loading") is not False):
+                raise TradingViewError("Deep rapor stratejisi veya hazır durumu eşleşmiyor.")
+            dates = data.get("selected_dates")
+            try:
+                if not isinstance(dates, dict) or set(dates) != {"from", "to"}:
+                    raise ValueError
+                start, end = (date.fromisoformat(dates[key]) for key in ("from", "to"))
+                if start.isoformat() != dates["from"] or end.isoformat() != dates["to"] or start > end:
+                    raise ValueError
+                end_exclusive = end + timedelta(days=1)
+                zone = data.get("chart_timezone")
+                if not isinstance(zone, str) or not zone:
+                    raise ValueError
+                ZoneInfo(zone)
+            except (ValueError, TypeError, OverflowError, ZoneInfoNotFoundError) as exc:
+                raise TradingViewError("Deep rapor tarihi veya saat dilimi geçersiz.") from exc
+            bounds = (data.get("request_from_ms"), data.get("request_end_exclusive_ms"))
+            expected_bounds = tuple(int(datetime.combine(d, datetime.min.time(), timezone.utc).timestamp()*1000)
+                                    for d in (start, end_exclusive))
+            if any(type(v) is not int for v in bounds) or bounds != expected_bounds:
+                raise TradingViewError("Deep seçili günleri gerçek istek sınırlarıyla eşleşmiyor.")
+            symbol, timeframe = data.get("symbol"), data.get("timeframe")
+            if (not isinstance(symbol, str) or not re.fullmatch(r"[^\s:]+:[^\s:]+", symbol)
+                    or not isinstance(timeframe, str) or not re.fullmatch(r"[1-9]\d*", timeframe)):
+                raise TradingViewError("Deep sembolü veya zaman dilimi doğrulanamadı.")
+            inputs = data.get("inputs")
+            if not isinstance(inputs, dict) or not inputs or any(
+                    not isinstance(k, str) or not re.fullmatch(r"in_\d+", k)
+                    or type(v) not in {str, bool, int, float}
+                    or (type(v) is int and abs(v) > 2**53 - 1)
+                    or (type(v) is float and not math.isfinite(v)) for k, v in inputs.items()):
+                raise TradingViewError("Deep Pine ayar değerleri doğrulanamadı.")
+            settings, trades, performance = (data.get(k) for k in ("settings", "trades", "performance"))
+            if (not isinstance(settings, dict) or not isinstance(trades, list)
+                    or not isinstance(performance, dict) or not isinstance(performance.get("all"), dict)):
+                raise TradingViewError("Deep rapor verisi eksik.")
+            def json_values(value: Any) -> bool:
+                if value is None or type(value) in {str, bool}:
+                    return True
+                if type(value) is int:
+                    return abs(value) <= 2**53 - 1
+                if type(value) is float:
+                    return math.isfinite(value)
+                if isinstance(value, list):
+                    return all(json_values(v) for v in value)
+                if isinstance(value, dict):
+                    return all(isinstance(k, str) and json_values(v) for k, v in value.items())
+                return False
+            if not all(json_values(v) for v in (settings, trades, performance)) or any(not isinstance(t, dict) for t in trades):
+                raise TradingViewError("Deep rapor verisinin türü geçersiz.")
+            ranges = settings.get("dateRange")
+            observed = ranges.get("backtest", {}) if isinstance(ranges, dict) else {}
+            if (not isinstance(observed, dict) or any(type(observed.get(k)) is not int for k in ("from", "to"))
+                    or not bounds[0] <= observed["from"] <= observed["to"] < bounds[1]):
+                raise TradingViewError("Deep gözlenen dönem seçili istek dışında veya eksik.")
+            from .report_currency import report_currency_code
+            currency = data.get("currency")
+            if currency is not None and report_currency_code(currency) is None:
+                raise TradingViewError("Deep rapor para birimi doğrulanamadı.")
+            return DeepReportModelState(*bounds, dates, zone, study_id, inputs, symbol, timeframe,
+                                        2, False, False, settings, tuple(trades), performance, currency)
+        first, second = read(), read()
+        if first != second:
+            raise TradingViewError("Bağımsız Deep rapor modeli okuma sırasında değişti.")
+        return second
 
     def strategy_properties_ui_state(self, target_id: str) -> StrategyPropertiesUiState:
         """Read visible Strategy Properties without changing or saving any value."""
@@ -333,7 +694,21 @@ class GncZihinDriver:
               close[0].click();return true;
             })()""")
             if closed is not True:
-                raise TradingViewError("Strategy Properties kaydetmeden kapatılamadı.")
+                raise TradingViewError(f"Strategy Properties kaydetmeden kapatılamadı: {closed!r}")
+            for _attempt in range(10):
+                self.target_guard(target_id)
+                absent = self._motor._eval(target_id, r"""(()=>{
+                  const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+                  return ![...document.querySelectorAll('[data-name="indicator-properties-dialog"][role="dialog"]')]
+                    .some(visible);
+                })()""")
+                if absent is True:
+                    break
+                time.sleep(0.1)
+            else:
+                raise TradingViewError(
+                    "Strategy Properties kapatma tıklandı ancak pencerenin kaybolduğu doğrulanamadı."
+                )
         if not isinstance(data, dict) or data.get("error"):
             raise TradingViewError(f"Strategy Properties okunamadı: {data!r}")
         def scalar(key: str) -> float:
@@ -533,6 +908,8 @@ class GncZihinDriver:
         return result
 
     def snapshot(self, target_id: str, study_id: str) -> StrategySnapshot:
+        from .report_warnings import WARNING_DOM_READ, classify_warning
+        from .report_currency import report_currency_code
         data = self._eval(target_id, study_id, r"""
             const r=s.reportData(),p=r?.performance,a=p?.all;
             const refresh=globalThis.__tvScanReportRefresh?.get(s.id());
@@ -542,13 +919,19 @@ class GncZihinDriver:
             return {status:s._status?.value?.(),symbol:c.symbol(),tf:String(c.resolution()),
               symbol_identity:si?{full_name:si.full_name,pro_name:si.pro_name,name:si.name,exchange:si.exchange}:null,
               inputs:c.getStudyById(s.id()).getInputValues().filter(v=>scriptIds.has(v.id)),
-              metrics:a?{trades:a.totalTrades,profit_factor:a.profitFactor,
+              metrics:a?{trades:a.totalTrades,
+                observed_open_trade_count:a.totalOpenTrades??null,
+                report_first_trade_index:r?.firstTradeIndex??null,
+                profit_factor:a.profitFactor,
                 win_rate_pct:a.percentProfitable*100,max_drawdown_pct:p.maxStrategyDrawDownPercent*100,
                 net_profit:a.netProfit,net_profit_pct:a.netProfitPercent*100}:null,
               period:r?.settings||null,trades:Array.isArray(r?.trades)?r.trades:[],
+              report_currency:r?.currency??null,
+              warning_observed:__WARNING_DOM_READ__,
               report_fresh:!!(refresh&&refresh.study===s&&r&&r!==refresh.before&&!s.isRestarting())};
-        """)
+        """.replace("__WARNING_DOM_READ__", "(()=>{" + WARNING_DOM_READ + "})()"))
         status = data.get("status") or {}
+        warning = classify_warning(data.get("warning_observed"), study_id)
         return StrategySnapshot(
             symbol=str(data.get("symbol", "")), timeframe=str(data.get("tf", "")),
             status_type=status.get("type") if isinstance(status, dict) else None,
@@ -559,7 +942,22 @@ class GncZihinDriver:
             report_source="chart",
             symbol_identity=data.get("symbol_identity"),
             report_fresh=data.get("report_fresh"),
+            warning_state=warning["state"], warning_evidence=warning,
+            report_currency=report_currency_code(data.get("report_currency")),
         )
+
+    def report_warning_state(self, target_id: str, study_id: str) -> dict[str, Any]:
+        """Read a uniquely bound tester banner without opening/closing any UI.
+
+        Hidden/unsupported/ambiguous panels yield unknown, never absent. A DOM
+        read failure is not a strategy execution failure and does not mutate it.
+        """
+        from .report_warnings import WARNING_DOM_READ, classify_warning
+        try:
+            observed = self._eval(target_id, study_id, WARNING_DOM_READ)
+        except Exception:
+            observed = None
+        return classify_warning(observed, study_id)
 
     def refresh_chart_report(self, target_id: str, study_id: str) -> None:
         """Recalculate the owned study after all inputs/properties are applied.
@@ -741,20 +1139,26 @@ class GncZihinDriver:
             raise TradingViewError("Update report düğmesi onaylanmadı.")
         deadline = time.monotonic() + 75
         stable = 0
+        last_ready = None
         while time.monotonic() < deadline:
             self.target_guard(target_id)
             try:
                 after = self.deep_report_ui_state(target_id)
             except TradingViewError:
                 stable = 0
+                last_ready = None
                 time.sleep(0.5)
                 continue
             if not after.update_pending and after.date_label == before.date_label:
-                stable += 1
+                # A retained date label is not a completed calculation: key
+                # stats can still change after Update report disappears.
+                stable = stable + 1 if after == last_ready else 1
+                last_ready = after
                 if stable >= 3:
                     return True
             else:
                 stable = 0
+                last_ready = None
             time.sleep(0.5)
         raise TradingViewError("Deep güncelleme zamanında tamamlanmadı.")
 
@@ -910,7 +1314,8 @@ def wait_for_verified_result(
     last: StrategySnapshot | None = None
     while time.monotonic() < deadline:
         last = driver.snapshot(target_id, study_id)
-        state = json.dumps([last.metrics, last.period, len(last.trades), last.trades[-1] if last.trades else None], sort_keys=True)
+        state = json.dumps([last.metrics, last.period, last.report_currency,
+                            len(last.trades), last.trades[-1] if last.trades else None], sort_keys=True)
         requested_tf = chart_resolution(expected["timeframe"])
         requested_dates = expected.get("date_range") or {}
         zone_reader = getattr(driver, "chart_timezone", None)

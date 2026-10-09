@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import csv
+import io
 import ctypes
 import os
 import re
@@ -14,6 +16,32 @@ import urllib.error
 from pathlib import Path
 from typing import Callable
 from .processes import HelperStartupError, run_hidden, popen_external
+
+
+class DiscoveryError(RuntimeError):
+    """Discovery failed; this must not be interpreted as TradingView closed."""
+
+
+def _output_text(value, encoding):
+    if isinstance(value, str):  # injected runners may already decode explicitly
+        return value
+    if not isinstance(value, bytes):
+        raise DiscoveryError("Arka plan işlem çıktısı okunamadı.")
+    try:
+        return value.decode(encoding, errors="strict")
+    except UnicodeError as exc:
+        raise DiscoveryError("Arka plan işlem çıktısının karakter kodlaması okunamadı.") from exc
+
+
+def _oem_encoding():
+    if os.name == "nt":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetOEMCP.restype = ctypes.c_uint
+        return f"cp{kernel.GetOEMCP()}"
+    return "utf-8"
+
+
+_POWERSHELL_UTF8 = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
 
 
 def _native_cdp_owner() -> bool:
@@ -94,23 +122,29 @@ def find_tradingview_executables(
         Path(env.get("PROGRAMFILES", "")) / "TradingView" / "TradingView.exe",
         Path(env.get("PROGRAMFILES(X86)", "")) / "TradingView" / "TradingView.exe",
     ]
+    failure = None
     try:
         result = run(
             ["powershell", "-NoProfile", "-Command",
-             "(Get-AppxPackage TradingView.Desktop -ErrorAction SilentlyContinue).InstallLocation"],
-            capture_output=True, text=True, timeout=8, check=False,
+             _POWERSHELL_UTF8 + "$ErrorActionPreference='Stop'; "
+             "try { (Get-AppxPackage TradingView.Desktop -ErrorAction Stop).InstallLocation } catch { exit 1 }"],
+            capture_output=True, text=False, timeout=8, check=False,
         )
-        for line in result.stdout.splitlines():
+        if result.returncode != 0:
+            raise DiscoveryError("TradingView kurulum araması başarısız; Windows paket erişimini kontrol edin.")
+        for line in _output_text(result.stdout, "utf-8-sig").splitlines():
             location = Path(line.strip())
             if line.strip():
                 candidates.extend((location / "TradingView.exe", location / "app" / "TradingView.exe"))
     except HelperStartupError:
         raise
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except (OSError, subprocess.SubprocessError, DiscoveryError) as exc:
+        failure = exc
     unique: list[Path] = []
     for candidate in candidates:
         if candidate.is_file() and candidate not in unique: unique.append(candidate)
+    if not unique and failure is not None:
+        raise DiscoveryError("TradingView yolu bulunamadı; kurulum araması tamamlanamadı.") from failure
     return unique
 
 
@@ -128,15 +162,18 @@ def cdp_owned_by_tradingview(
     try:
         result = run(
             ["powershell", "-NoProfile", "-Command",
-             "$p=Get-NetTCPConnection -LocalPort 9222 -State Listen -ErrorAction Stop; "
+             _POWERSHELL_UTF8 + "$p=Get-NetTCPConnection -LocalPort 9222 -State Listen -ErrorAction Stop; "
              "$p | Select-Object -ExpandProperty OwningProcess -Unique | "
              "ForEach-Object { (Get-Process -Id $_ -ErrorAction Stop).ProcessName }"],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, text=False, timeout=5, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         result = None
     if result is not None and result.returncode == 0:
-        owners = [line.strip().casefold() for line in result.stdout.splitlines() if line.strip()]
+        try:
+            owners = [line.strip().casefold() for line in _output_text(result.stdout, "utf-8-sig").splitlines() if line.strip()]
+        except DiscoveryError:
+            return False
         return bool(owners) and all(owner == "tradingview" for owner in owners)
 
     # Get-NetTCPConnection can be denied to an ordinary Windows user even when
@@ -144,11 +181,11 @@ def cdp_owned_by_tradingview(
     # check, but resolve listener PIDs through netstat in that case.
     try:
         sockets = run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
-                      text=True, timeout=5, check=False)
+                      text=False, timeout=5, check=False)
         if sockets.returncode != 0:
             return False
         pids = set()
-        for line in sockets.stdout.splitlines():
+        for line in _output_text(sockets.stdout, _oem_encoding()).splitlines():
             fields = line.split()
             if (len(fields) >= 5 and fields[0].upper() == "TCP"
                     and fields[1].rsplit(":", 1)[-1] == "9222"
@@ -161,12 +198,15 @@ def cdp_owned_by_tradingview(
         pid_list = ",".join(str(pid) for pid in sorted(pids))
         owners_result = run(
             ["powershell", "-NoProfile", "-Command",
-             f"@({pid_list}) | ForEach-Object {{ (Get-Process -Id $_ -ErrorAction Stop).ProcessName }}"],
-            capture_output=True, text=True, timeout=5, check=False,
+             _POWERSHELL_UTF8 + f"@({pid_list}) | ForEach-Object {{ (Get-Process -Id $_ -ErrorAction Stop).ProcessName }}"],
+            capture_output=True, text=False, timeout=5, check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, DiscoveryError):
         return False
-    owners = [line.strip().casefold() for line in owners_result.stdout.splitlines() if line.strip()]
+    try:
+        owners = [line.strip().casefold() for line in _output_text(owners_result.stdout, "utf-8-sig").splitlines() if line.strip()]
+    except DiscoveryError:
+        return False
     return (owners_result.returncode == 0 and len(owners) == len(pids)
             and all(owner == "tradingview" for owner in owners))
 
@@ -291,10 +331,18 @@ def tradingview_running(
 ) -> bool:
     try:
         result = run(["tasklist", "/FI", "IMAGENAME eq TradingView.exe", "/FO", "CSV"],
-                     capture_output=True, text=True, timeout=5, check=False)
-        return "TradingView.exe" in result.stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
+                     capture_output=True, text=False, timeout=5, check=False)
+        if result.returncode != 0:
+            raise DiscoveryError("TradingView çalışan işlem kontrolü başarısız.")
+        output = _output_text(result.stdout, _oem_encoding())
+        if not output.strip():
+            raise DiscoveryError("TradingView işlem kontrolü boş çıktı döndürdü.")
+        return any(row and row[0].casefold() == "tradingview.exe"
+                   for row in csv.reader(io.StringIO(output)))
+    except HelperStartupError:
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DiscoveryError("TradingView çalışan işlem durumu okunamadı.") from exc
 
 
 def launch_with_cdp(executable: str | Path, port: int = 9222) -> subprocess.Popen:

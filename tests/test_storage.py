@@ -16,6 +16,23 @@ def test_project_stores_pine_source_hash(tmp_path):
     assert store.project(project)["pine_hash"] == hashlib.sha256(source.encode()).hexdigest()
 
 
+@pytest.mark.parametrize("stop_at", [1, 2, 3])
+def test_cancelled_claim_rolls_back_task_attempt_and_project_status(tmp_path, stop_at):
+    store = Store(tmp_path / "cancel-claim.db")
+    project = store.create_project("Cancel", 'strategy("Cancel")')
+    store.enqueue(project, "waiting", {})
+    before = store.project(project)
+    checks = 0
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        return checks >= stop_at
+    assert store.claim_next(1, [project], cancel_requested=cancelled) is None
+    assert store.project(project) == before
+    assert store.counts(project) == {"pending": 1}
+    assert store.tasks(project)[0]["attempts"] == 0
+
+
 def test_interrupted_tasks_are_requeued(tmp_path):
     store = Store(tmp_path / "studio.db")
     project = store.create_project("FTMO ICT", 'strategy("ICT")')

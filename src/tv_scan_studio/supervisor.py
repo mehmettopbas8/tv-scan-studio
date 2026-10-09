@@ -19,6 +19,7 @@ class WorkerAssignment:
     target_id: str
     project_ids: tuple[int, ...]
     study_id: str | None = None
+    run_ids: tuple[int, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -54,6 +55,22 @@ class WorkerSupervisor:
     @property
     def running(self) -> bool:
         return any(thread.is_alive() for thread in self._threads)
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def stopping(self) -> bool:
+        return self.stop_requested and self.running
+
+    def request_stop(self) -> None:
+        """Close task admission immediately without joining worker threads."""
+        self._stop.set()
+        for worker_id, state in self.states.items():
+            thread = self._threads_by_worker.get(worker_id)
+            if thread and thread.is_alive() and state.status != "failed":
+                state.status = "stopping"
 
     def start(self, assignments: list[WorkerAssignment], *, stop_when_idle: bool = False) -> None:
         if self.running:
@@ -106,6 +123,8 @@ class WorkerSupervisor:
             assignment.worker_id, assignment.target_id, self.store, self.driver,
             list(assignment.project_ids), assignment.study_id, self.target_guard,
             self.download_directory,
+            cancel_requested=self._stop.is_set,
+            run_ids=list(assignment.run_ids) if assignment.run_ids is not None else None,
         )
         state = self.states[assignment.worker_id]
         try:
@@ -125,10 +144,13 @@ class WorkerSupervisor:
             state.status = "failed"; state.error = str(exc); state.last_seen = time.time()
             self.store.log_event("error", str(exc), worker_id=assignment.worker_id)
         finally:
-            if state.status not in {"failed", "idle"}: state.status = "stopped"
+            if self._stop.is_set() and state.status != "failed":
+                state.status = "stopped"
+            elif state.status not in {"failed", "idle"}:
+                state.status = "stopped"
 
     def stop(self, timeout: float = 10) -> None:
-        self._stop.set()
+        self.request_stop()
         deadline = time.monotonic() + timeout
         for thread in self._threads:
             thread.join(max(0, deadline - time.monotonic()))

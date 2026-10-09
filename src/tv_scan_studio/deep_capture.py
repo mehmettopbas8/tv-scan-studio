@@ -5,12 +5,16 @@ from __future__ import annotations
 import threading
 import time
 import math
+import hashlib
+import json
+from dataclasses import asdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 from .deep_export import (DeepExport, DeepExportError, read_deep_export,
-                          verify_deep_export, verify_deep_input_values,
+                          observed_report_period, observed_report_currency,
+                          verify_deep_export, verify_deep_input_values, verify_deep_total_pnl,
                           wait_for_unique_fresh_xlsx, xlsx_download_baseline)
 from .tradingview import (StrategyPropertiesUiState, StrategySnapshot,
                           chart_resolution, symbol_matches)
@@ -28,6 +32,11 @@ class DeepCapture:
     study_id: str
     chart_timezone: str
     symbol_identity: dict[str, Any] | None = None
+    report_period: dict[str, Any] | None = None
+    report_currency: str | None = None
+    warning_state: str = "unknown"
+    warning_evidence: dict[str, Any] | None = None
+    model_evidence: dict[str, Any] | None = None
 
 
 def _assert_chart_task(snapshot: StrategySnapshot, expected: dict[str, Any]) -> None:
@@ -114,6 +123,10 @@ def capture_task_deep_export(driver: Any, *, target_id: str, study_id: str,
         ui_before = driver.deep_report_ui_state(target_id)
         if ui_before.update_pending:
             raise DeepExportError("Deep rapor güncellemesi hâlâ bekliyor.")
+        model_reader = getattr(driver, 'deep_report_model_state', None)
+        model_before = model_reader(target_id, study_id) if callable(model_reader) else None
+        if callable(model_reader) and model_before is None:
+            raise DeepExportError("Bağımsız Deep rapor kaynağı okunamadı.")
         baseline = xlsx_download_baseline(download_directory)
         started_ns = time.time_ns()
         guard(target_id)
@@ -133,10 +146,17 @@ def capture_task_deep_export(driver: Any, *, target_id: str, study_id: str,
         ui_after = driver.deep_report_ui_state(target_id)
         if ui_before != ui_after:
             raise DeepExportError("Deep rapor indirme sırasında değişti.")
+        model_after = model_reader(target_id, study_id) if callable(model_reader) else None
+        if callable(model_reader) and model_after is None:
+            raise DeepExportError("Bağımsız Deep rapor kaynağı okunamadı.")
+        if model_before != model_after:
+            raise DeepExportError("Bağımsız Deep rapor kaynağı indirme sırasında değişti.")
         guard(target_id)
         cost_after = driver.strategy_properties_ui_state(target_id)
         if cost_before != cost_after:
             raise DeepExportError("TradingView Strategy Properties indirme sırasında değişti.")
+        if ui_after.total_pnl is not None:
+            verify_deep_total_pnl(report, ui_after.total_pnl)
         trades = verify_deep_export(
             report, symbol=expected["symbol"], timeframe=expected["timeframe"],
             date_range=expected["date_range"], chart_timezone=zone,
@@ -144,11 +164,37 @@ def capture_task_deep_export(driver: Any, *, target_id: str, study_id: str,
             ui_metrics=ui_after.metrics, ui_date_label=ui_after.date_label,
             ui_update_pending=ui_after.update_pending,
             symbol_identity=chart_after.symbol_identity,
+            **({'model_state': model_after, 'expected_inputs': expected.get('inputs', {}),
+                'study_id': study_id} if model_after is not None else {}),
         )
         verified = verify_deep_input_values(
             report, pine_source=pine_source, expected_inputs=expected.get("inputs", {}),
             changed_input_ids=changed_input_ids,
         )
-        return DeepCapture(report, trades, verified, target_id, study_id, zone, chart_after.symbol_identity)
+        currency = observed_report_currency(report)
+        if currency is not None and chart_after.report_currency is not None and currency != chart_after.report_currency:
+            raise DeepExportError("XLSX para birimi canlı strateji raporuyla eşleşmiyor.")
+        model_evidence = None
+        if model_after is not None:
+            from .deep_model_evidence import verify_model_bound_export
+            observed_period = verify_model_bound_export(report, model_after,
+                expected={**expected, 'symbol_identity': chart_after.symbol_identity},
+                study_id=study_id, chart_timezone=zone)
+            model_evidence = {'provenance': model_after.provenance,
+                'model_sha256': hashlib.sha256(json.dumps(asdict(model_after), sort_keys=True,
+                    separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest(),
+                'request_from_ms': model_after.request_from_ms,
+                'request_end_exclusive_ms': model_after.request_end_exclusive_ms,
+                'selected_dates': dict(model_after.selected_dates),
+                'export_sha256': report.sha256, 'export_timezone': zone}
+        else:
+            observed_period = observed_report_period(report, zone)
+        return DeepCapture(
+            report, trades, verified, target_id, study_id, zone,
+            chart_after.symbol_identity, observed_period,
+            currency, chart_after.warning_state,
+            chart_after.warning_evidence,
+            model_evidence,
+        )
     finally:
         _DOWNLOAD_LOCK.release()

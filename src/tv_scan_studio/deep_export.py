@@ -20,6 +20,7 @@ from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .pine import parse_strategy_inputs
+from .report_currency import report_currency_code
 from .tradingview import chart_resolution, symbol_matches
 
 
@@ -101,6 +102,18 @@ class DeepExport:
     backtesting_range: str
     sha256: str
     mtime_ns: int
+    performance_headers: tuple[str, ...] = ()
+    performance_headers_provenance: str = "unknown"
+    trade_pnl_header: str | None = None
+    open_trade_count: int = 0
+    open_pnl: float | None = None
+
+
+def _trade_pnl_header(headers) -> str:
+    monetary = [key for key in headers if isinstance(key, str) and key.startswith("Net PnL ")]
+    if len(monetary) != 1 or report_currency_code(monetary[0][8:]) is None:
+        raise DeepExportError("TradingView işlem kâr/zarar para birimi eksik veya belirsiz.")
+    return monetary[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,14 +221,16 @@ def verify_deep_input_values(report: DeepExport, *, pine_source: str,
     return tuple(verified)
 
 
-def normalized_closed_trades(report: DeepExport) -> tuple[dict[str, Any], ...]:
+def normalized_closed_trades(report: DeepExport, *, authenticated_timezone: str | None = None) -> tuple[dict[str, Any], ...]:
     """Convert paired XLSX entry/exit rows for closed-trade analytics.
 
     TradingView exports Excel serial dates in the chart's configured timezone.
     The duplicated PnL on entry and exit rows is counted only once. These
     records contain no intrabar equity, so they cannot prove FTMO loss limits.
     """
-    zone_name = report.properties.get("Timezone", "")
+    # Conversion is not provenance. The capture path may supply a zone only
+    # after every native row matches the independently bound Deep model.
+    zone_name = authenticated_timezone or report.properties.get("Timezone", "")
     try:
         zone = ZoneInfo(zone_name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -234,6 +249,13 @@ def normalized_closed_trades(report: DeepExport) -> tuple[dict[str, Any], ...]:
         return round(aware.timestamp() * 1000)
 
     pairs: dict[int, dict[str, dict[str, Any]]] = {}
+    headers = set().union(*(row.keys() for row in report.trades)) if report.trades else set()
+    pnl_header = report.trade_pnl_header or (_trade_pnl_header(headers) if headers else None)
+    if headers and _trade_pnl_header(headers) != pnl_header:
+        raise DeepExportError("TradingView işlem para birimi sütunuyla eşleşmiyor.")
+    has_unit_header = bool(report.performance_headers and report.performance_headers[0] == "")
+    if pnl_header and (pnl_header != "Net PnL USD" or has_unit_header) and observed_report_currency(report) != pnl_header[8:]:
+        raise DeepExportError("TradingView işlem ve rapor para birimleri doğrulanamadı.")
     for row in report.trades:
         number = row.get("Trade number")
         kind = str(row.get("Type") or "")
@@ -247,6 +269,7 @@ def normalized_closed_trades(report: DeepExport) -> tuple[dict[str, Any], ...]:
         record[key] = row
 
     normalized: list[dict[str, Any]] = []
+    open_values: list[float] = []
     for number in sorted(pairs):
         record = pairs[number]
         if set(record) != {"entry", "exit"}:
@@ -255,21 +278,39 @@ def normalized_closed_trades(report: DeepExport) -> tuple[dict[str, Any], ...]:
         side = str(entry["Type"]).split()[1]
         if exit_["Type"] != f"Exit {side}":
             raise DeepExportError("TradingView işlem yönü giriş ve çıkışta farklı.")
-        entry_ms, exit_ms = timestamp_ms(entry), timestamp_ms(exit_)
-        if exit_ms < entry_ms:
+        entry_ms = timestamp_ms(entry)
+        is_open = exit_.get("Signal") == "Open"
+        # Native Deep exports explicitly write "Open" instead of inventing an
+        # exit time for an unclosed position. Numeric mark times remain checked.
+        exit_ms = None if is_open and exit_.get("Date and time") == "Open" else timestamp_ms(exit_)
+        if exit_ms is not None and exit_ms < entry_ms:
             raise DeepExportError("TradingView işlem çıkışı girişten önce.")
-        pnl = exit_.get("Net PnL USD")
+        pnl = exit_.get(pnl_header)
         if isinstance(pnl, bool) or not isinstance(pnl, (int, float)) or not -float("inf") < pnl < float("inf"):
             raise DeepExportError("TradingView işlem kâr/zararı geçersiz.")
+        if entry.get("Signal") == "Open":
+            raise DeepExportError("TradingView açık işlem işareti giriş satırında olamaz.")
+        if is_open:
+            open_values.append(float(pnl))
+            continue
         normalized.append({
             "e": {"tm": entry_ms, "tp": side, "c": str(entry.get("Signal") or "")},
             "x": {"tm": exit_ms}, "tp": {"v": float(pnl)},
         })
+    _verify_open_totals(open_values, report.open_trade_count, report.open_pnl)
     if len(normalized) != report.metrics["trades"]:
         raise DeepExportError("TradingView eşleştirilmiş işlem sayısı raporla uyuşmuyor.")
     if abs(sum(item["tp"]["v"] for item in normalized) - report.metrics["net_profit"]) > 0.05:
         raise DeepExportError("TradingView işlem kâr/zararı rapor toplamıyla uyuşmuyor.")
     return tuple(normalized)
+
+
+def _verify_open_totals(values: list[float], count: int, pnl: float | None) -> None:
+    if type(count) is not int or count < 0 or len(values) != count:
+        raise DeepExportError("TradingView açık işlem sayısı raporla uyuşmuyor.")
+    if values or pnl is not None:
+        if type(pnl) not in {int, float} or not math.isfinite(pnl) or abs(sum(values) - pnl) > 0.05:
+            raise DeepExportError("TradingView açık işlem kâr/zararı raporla uyuşmuyor.")
 
 
 def _cell_value(cell: ET.Element, shared: list[str]) -> str | float | int | None:
@@ -399,15 +440,30 @@ def summarize_deep_export(tables: dict[str, list[list[Any]]], sha256: str = "",
     if not trade_rows or len(trade_rows) - 1 > MAX_TRADE_ROWS:
         raise DeepExportError("TradingView işlem listesi boş veya desteklenen sınırdan büyük.")
     headers = [str(value or "") for value in trade_rows[0]]
-    required_headers = {"Trade number", "Type", "Date and time", "Net PnL USD"}
+    required_headers = {"Trade number", "Type", "Date and time"}
     if not required_headers.issubset(headers) or len(set(headers)) != len(headers):
         raise DeepExportError("TradingView işlem sütunları eksik veya yineleniyor.")
+    pnl_header = _trade_pnl_header(headers)
     trades = tuple(dict(zip(headers, row)) for row in trade_rows[1:] if any(value is not None for value in row))
     total_trades = _number(analysis, "Total trades")
     if not total_trades.is_integer() or total_trades < 0:
         raise DeepExportError("TradingView toplam işlem sayısı geçersiz.")
     exits = [row for row in trades if str(row.get("Type", "")).startswith("Exit ")]
-    if len(exits) != int(total_trades):
+    open_exits = [row for row in exits if row.get("Signal") == "Open"]
+    open_labels = _labeled_rows(analysis, "Total open trades")
+    open_count_value = _number(analysis, "Total open trades") if open_labels or open_exits else 0.0
+    if not math.isfinite(open_count_value) or not open_count_value.is_integer() or open_count_value < 0:
+        raise DeepExportError("TradingView açık işlem sayısı geçersiz.")
+    open_pnl_labels = _labeled_rows(performance, "Open PnL")
+    open_pnl = _number(performance, "Open PnL") if open_pnl_labels or open_exits else None
+    open_values = []
+    for row in open_exits:
+        value = row.get(pnl_header)
+        if type(value) not in {int, float} or not math.isfinite(value):
+            raise DeepExportError("TradingView açık işlem kâr/zararı geçersiz.")
+        open_values.append(float(value))
+    _verify_open_totals(open_values, int(open_count_value), open_pnl)
+    if len(exits) - len(open_exits) != int(total_trades):
         raise DeepExportError("TradingView işlem listesi ile toplam işlem sayısı eşleşmiyor.")
     gross_profit = _number(performance, "Gross profit")
     gross_loss = _number(performance, "Gross loss")
@@ -434,7 +490,17 @@ def summarize_deep_export(tables: dict[str, list[list[Any]]], sha256: str = "",
         "net_profit": net_profit,
         "net_profit_pct": _number(performance, "Net profit", 2),
     }
-    return DeepExport(metrics, properties, trades, backtesting_range, sha256, mtime_ns)
+    # Keep the actual first Performance row, not labels reconstructed from metrics
+    # or Properties/Pine inputs. Unknown layouts are retained but not promoted.
+    headers_evidence = tuple(str(value) if value is not None else "" for value in performance[0]) if performance else ()
+    report = DeepExport(metrics, properties, trades, backtesting_range, sha256, mtime_ns,
+                        headers_evidence, "performance_sheet_row1", pnl_header,
+                        int(open_count_value), open_pnl)
+    # Legacy USD exports without a Performance header remain readable, but do not
+    # gain report-currency evidence. Other units require explicit matching proof.
+    if (pnl_header != "Net PnL USD" or (headers_evidence and headers_evidence[0] == "")) and observed_report_currency(report) != pnl_header[8:]:
+        raise DeepExportError("TradingView işlem ve rapor para birimleri eşleşmiyor veya belirsiz.")
+    return report
 
 
 def read_deep_export(path: str | Path, *, downloaded_after_ns: int = 0) -> DeepExport:
@@ -460,16 +526,94 @@ _TIMEFRAME_LABELS = {
 
 
 def _utc_bounds(backtesting_range: str, chart_timezone: str) -> tuple[datetime, datetime]:
+    if not isinstance(backtesting_range, str) or not isinstance(chart_timezone, str):
+        raise DeepExportError("TradingView XLSX tarih aralığı veya saat dilimi okunamadı.")
     bounds = backtesting_range.split(" — ")
     if len(bounds) != 2:
         raise DeepExportError("TradingView XLSX tarih aralığı okunamadı.")
     try:
         zone = ZoneInfo(chart_timezone)
-        local = [datetime.strptime(value, "%b %d, %Y, %H:%M").replace(tzinfo=zone)
-                 for value in bounds]
-    except (ValueError, ZoneInfoNotFoundError) as exc:
+        try:
+            local = [datetime.strptime(value, "%b %d, %Y, %H:%M") for value in bounds]
+        except ValueError:
+            # Date-only exports include the stated final day. Minute-precision
+            # exports already expose the exclusive final boundary (verifier contract).
+            local = [datetime.strptime(value, "%b %d, %Y") for value in bounds]
+            local[1] += timedelta(days=1)
+        for stamp in local:
+            aware = stamp.replace(tzinfo=zone)
+            if (aware.utcoffset() != stamp.replace(tzinfo=zone, fold=1).utcoffset() or
+                    aware.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) != stamp):
+                raise DeepExportError("TradingView XLSX tarihinin saat dilimi dönüşümü belirsiz veya geçersiz.")
+        local = [stamp.replace(tzinfo=zone) for stamp in local]
+    except (ValueError, OverflowError, ZoneInfoNotFoundError) as exc:
         raise DeepExportError("TradingView XLSX saat dilimi veya tarihi geçersiz.") from exc
-    return local[0].astimezone(timezone.utc), local[1].astimezone(timezone.utc)
+    start, stop = local[0].astimezone(timezone.utc), local[1].astimezone(timezone.utc)
+    if start >= stop:
+        raise DeepExportError("TradingView XLSX tarih aralığı boş veya ters.")
+    return start, stop
+
+
+def observed_report_period(report: DeepExport, chart_timezone: str) -> dict[str, Any]:
+    """Observed export range in UTC, without any requested-plan substitution.
+
+    to_ms is inclusive; end_exclusive_ms retains the exact exported boundary.
+    This parser alone does not prove task/layout identity or a fresh download.
+    """
+    if report.properties.get("Timezone") != chart_timezone:
+        raise DeepExportError("TradingView XLSX gözlenen döneminin saat dilimi eşleşmiyor.")
+    start, stop = _utc_bounds(report.backtesting_range, chart_timezone)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    # Integer datetime arithmetic, avoiding float rounding of exact boundaries.
+    start_ms = (start - epoch) // timedelta(milliseconds=1)
+    stop_ms = (stop - epoch) // timedelta(milliseconds=1)
+    return {"from_ms": start_ms, "to_ms": stop_ms - 1,
+            "end_exclusive_ms": stop_ms, "timezone": "UTC"}
+
+
+def observed_report_currency(report: DeepExport) -> str | None:
+    """Currency explicitly attached to monetary Performance columns.
+
+    Fixed All/Long/Short monetary and percentage columns were observed in native
+    exports. Require their exact seven-column schema and consistent known code;
+    unknown layouts remain None. Flattened Properties include Pine titles and are
+    not authoritative. Symbol/account names and trade-column units never establish
+    the report currency by themselves.
+    """
+    headers = report.performance_headers
+    if (report.performance_headers_provenance != "performance_sheet_row1" or
+            not isinstance(headers, tuple) or len(headers) != 7 or
+            any(not isinstance(value, str) for value in headers)):
+        return None
+    if headers[0] != "" or (headers[2], headers[4], headers[6]) != ("All %", "Long %", "Short %"):
+        return None
+    supported = {"USD", "EUR", "AUD", "GBP", "NZD", "CAD", "CHF", "HKD",
+                 "JPY", "NOK", "SEK", "SGD", "TRY", "ZAR"}
+    codes = []
+    for index, label in ((1, "All"), (3, "Long"), (5, "Short")):
+        match = re.fullmatch(label + r" ([A-Z]{3})", headers[index])
+        if match is None or match.group(1) not in supported:
+            return None
+        codes.append(match.group(1))
+    if len(set(codes)) != 1:
+        return None
+    code = codes[0]
+    trade_units = {match.group(1) for row in report.trades for key in row
+                   if (match := re.fullmatch(r"Net PnL ([A-Z]{3})", key))}
+    return code if not trade_units or trade_units == {code} else None
+
+
+def verify_deep_total_pnl(report: DeepExport, total_pnl: float) -> None:
+    """Reconcile observed open-inclusive UI total without relabeling closed net.
+
+    Missing Open PnL is not an observed zero, even with no open trade rows.
+    The caller still has to bind UI and export to the same fresh guarded report.
+    """
+    values = (total_pnl, report.metrics.get("net_profit"), report.open_pnl)
+    if any(type(value) not in {int, float} or not math.isfinite(value) for value in values):
+        raise DeepExportError("Canlı Deep toplam/açık işlem kârı eksik veya geçersiz.")
+    if abs(total_pnl - (report.metrics["net_profit"] + report.open_pnl)) > 0.011:
+        raise DeepExportError("Canlı Deep toplam kârı kapanmış ve açık işlemlerle eşleşmiyor.")
 
 
 def verify_deep_export(report: DeepExport, *, symbol: str, timeframe: str,
@@ -478,7 +622,10 @@ def verify_deep_export(report: DeepExport, *, symbol: str, timeframe: str,
                        ui_metrics: dict[str, float | int] | None = None,
                        ui_date_label: str | None = None,
                        ui_update_pending: bool | None = None,
-                       symbol_identity: dict[str, Any] | None = None) -> tuple[dict[str, Any], ...]:
+                       symbol_identity: dict[str, Any] | None = None,
+                       model_state: Any = None,
+                       expected_inputs: dict[str, Any] | None = None,
+                       study_id: str | None = None) -> tuple[dict[str, Any], ...]:
     """Verify XLSX identity and trades against the task and live report UI.
 
     This does not by itself verify that the UI/export came from the same guarded
@@ -492,7 +639,7 @@ def verify_deep_export(report: DeepExport, *, symbol: str, timeframe: str,
     expected_tf = _TIMEFRAME_LABELS.get(chart_resolution(timeframe), "")
     if not expected_tf or report.properties["Timeframe"] != expected_tf:
         raise DeepExportError("TradingView XLSX zaman dilimi görevle eşleşmiyor.")
-    if report.properties.get("Timezone") != chart_timezone:
+    if model_state is None and report.properties.get("Timezone") != chart_timezone:
         raise DeepExportError("TradingView XLSX saat dilimi chart ile eşleşmiyor.")
     required_costs = ("initial_capital", "position_size", "slippage", "commission_value")
     if not isinstance(cost_assumptions, dict) or any(name not in cost_assumptions for name in required_costs):
@@ -510,11 +657,21 @@ def verify_deep_export(report: DeepExport, *, symbol: str, timeframe: str,
         raise DeepExportError("Görev tarih aralığı geçersiz.") from exc
     if requested_from > requested_to:
         raise DeepExportError("Görev tarih aralığı ters.")
-    observed_from, observed_end_exclusive = _utc_bounds(report.backtesting_range, chart_timezone)
-    expected_from = datetime.combine(requested_from, time.min, timezone.utc)
-    expected_end_exclusive = datetime.combine(requested_to + timedelta(days=1), time.min, timezone.utc)
-    if observed_from != expected_from or observed_end_exclusive != expected_end_exclusive:
-        raise DeepExportError("TradingView XLSX tarih aralığı görevle eşleşmiyor.")
+    if model_state is not None:
+        if not study_id or expected_inputs is None:
+            raise DeepExportError("Bağımsız Deep strateji/ayar beklentisi eksik.")
+        from .deep_model_evidence import verify_model_bound_export
+        verify_model_bound_export(report, model_state, study_id=study_id,
+            chart_timezone=chart_timezone, expected={'symbol': symbol, 'timeframe': timeframe,
+                'date_range': date_range, 'inputs': expected_inputs, 'symbol_identity': symbol_identity})
+    else:
+        # Legacy explicit-property contracts remain fail-closed. Native captures
+        # use the separate manager-bound proof, not guessed/mutated properties.
+        observed_from, observed_end_exclusive = _utc_bounds(report.backtesting_range, chart_timezone)
+        expected_from = datetime.combine(requested_from, time.min, timezone.utc)
+        expected_end_exclusive = datetime.combine(requested_to + timedelta(days=1), time.min, timezone.utc)
+        if observed_from != expected_from or observed_end_exclusive != expected_end_exclusive:
+            raise DeepExportError("TradingView XLSX tarih aralığı görevle eşleşmiyor.")
     if ui_update_pending is not False:
         raise DeepExportError("Canlı Deep rapor henüz güncel olarak doğrulanmadı.")
     try:
@@ -535,4 +692,5 @@ def verify_deep_export(report: DeepExport, *, symbol: str, timeframe: str,
             raise DeepExportError("Canlı Deep rapor metriği eksik: " + name)
         if abs(float(observed) - float(shown)) > tolerance:
             raise DeepExportError("Canlı Deep rapor metriği XLSX ile eşleşmiyor: " + name)
-    return normalized_closed_trades(report)
+    return normalized_closed_trades(report,
+        authenticated_timezone=chart_timezone if model_state is not None else None)

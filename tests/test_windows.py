@@ -41,6 +41,57 @@ def test_finds_normal_and_store_installations(tmp_path):
     assert store / "TradingView.exe" in found
 
 
+def test_discovery_utf8_preserves_turkish_paths(tmp_path):
+    store = tmp_path / "İşlem_ışık_Özel"
+    store.mkdir(); (store / "TradingView.exe").touch()
+    def run(args, **kwargs):
+        assert kwargs["text"] is False
+        assert "OutputEncoding" in args[-1] and "UTF8Encoding" in args[-1]
+        return CompletedProcess(args, 0, stdout=(str(store)+"\r\n").encode("utf-8"), stderr=b"")
+    assert find_tradingview_executables(env={"LOCALAPPDATA": str(tmp_path)}, run=run) == [store / "TradingView.exe"]
+
+
+@pytest.mark.parametrize("output,code", [(b"\x8d", 0), (b"", 1)])
+def test_failed_discovery_not_successful_empty(tmp_path, output, code):
+    from tv_scan_studio.windows import DiscoveryError
+    with pytest.raises(DiscoveryError):
+        find_tradingview_executables(env={"LOCALAPPDATA": str(tmp_path)},
+            run=lambda args, **kwargs: CompletedProcess(args, code, stdout=output, stderr=b""))
+
+
+def test_tasklist_oem_does_not_decode_cp1254(monkeypatch):
+    from tv_scan_studio import windows
+    monkeypatch.setattr(windows, "_oem_encoding", lambda: "cp857")
+    def run(args, **kwargs):
+        assert kwargs["text"] is False
+        return CompletedProcess(args, 0, stdout='"TradingView.exe","100","ışık"\r\n'.encode("cp857"), stderr=b"")
+    assert windows.tradingview_running(run)
+    assert not windows.tradingview_running(lambda *args, **kwargs: CompletedProcess(args, 0,
+        stdout='BİLGİ: Eşleşen görev yok.'.encode("cp857"), stderr=b""))
+
+
+def test_tasklist_failure_never_means_closed():
+    from tv_scan_studio.windows import tradingview_running, DiscoveryError
+    for code in (0, 1):
+        with pytest.raises(DiscoveryError):
+            tradingview_running(lambda *args, **kwargs: CompletedProcess(args, code, stdout=b"", stderr=b""))
+
+
+def test_unknown_running_status_never_launches_or_checks_cdp(tmp_path, monkeypatch):
+    from tv_scan_studio import windows
+    executable = tmp_path / "TradingView.exe"
+    executable.touch()
+    def unknown():
+        raise windows.DiscoveryError("Çalışan işlem durumu okunamadı.")
+    called = []
+    monkeypatch.setattr(windows, "tradingview_running", unknown)
+    monkeypatch.setattr(windows, "cdp_healthy", lambda *args: called.append("cdp") or False)
+    monkeypatch.setattr(windows, "popen_external", lambda *args, **kwargs: called.append("launch"))
+    with pytest.raises(windows.DiscoveryError):
+        windows.launch_with_cdp(executable)
+    assert called == []
+
+
 def test_new_workers_open_as_tabs_on_the_same_cdp_port():
     calls = []
     class Response(io.BytesIO):
